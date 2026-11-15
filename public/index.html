@@ -39,7 +39,7 @@ button:focus-visible{outline:3px solid var(--fg);outline-offset:3px}
 @media (prefers-reduced-motion:reduce){.banner.go{animation:none;opacity:1}}
 </style></head><body>
 <canvas id="c"></canvas>
-<div class="hud"><div class="floor" id="fl">Floor 1</div><div class="pips" id="pips"></div></div>
+<div class="hud"><div class="floor" id="fl">Floor 1</div><div class="pips" id="pips"></div><div id="lv" style="margin-top:8px;font-size:13px;color:var(--dim)"></div></div>
 <div class="dash"><div class="bar" style="margin:0 0 8px"><b id="pb" style="background:var(--hot);width:0"></b></div><span id="dt">Dash ready · Space</span><div class="bar"><b id="db"></b></div></div>
 <div class="banner" id="bn"></div>
 <button class="devbtn hide" id="devbtn">Test panel</button>
@@ -52,23 +52,26 @@ button:focus-visible{outline:3px solid var(--fg);outline-offset:3px}
 <script>
 const cv=document.getElementById('c'),g=cv.getContext('2d'),$=id=>document.getElementById(id);
 let W,H;function rs(){W=cv.width=innerWidth;H=cv.height=innerHeight}addEventListener('resize',rs);rs();
-const A=2400,NEED=5,R=(a,b)=>a+Math.random()*(b-a);
-let WL=[],dm=1.6,ws,my=0,floor=0,kills=-1,dcd=0,E=new Map(),AR=[],arT=0,fx=[],shake=0,down=false,mouse={x:0,y:0},last=0,bt;
+const A=2400,NEED=3,R=(a,b)=>a+Math.random()*(b-a);
+let lives=5,cw=0,WL=[],dm=1.6,ws,my=0,floor=0,kills=-1,dcd=0,E=new Map(),AR=[],arT=0,fx=[],shake=0,down=false,mouse={x:0,y:0},last=0,bt;
 const pips=$('pips');for(let i=0;i<NEED;i++)pips.appendChild(document.createElement('i'));
-function hud(){$('fl').textContent='Floor '+floor;[...pips.children].forEach((p,i)=>p.classList.toggle('on',i<kills))}
+function hud(){$('fl').textContent='Floor '+floor;$('lv').textContent='Lives: '+lives;[...pips.children].forEach((p,i)=>p.classList.toggle('on',i<kills))}
 function banner(t){const b=$('bn');clearTimeout(bt);b.textContent=t;b.classList.remove('go');void b.offsetWidth;b.classList.add('go');bt=setTimeout(()=>b.classList.remove('go'),1600)}
 function burst(x,y,h,n){for(let i=0;i<n;i++){const a=R(0,6.28),s=R(80,380);fx.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,l:R(.3,.7),h})}}
+function join(){ws.send(JSON.stringify({t:'join',name:$('nm').value||'player',key:new URLSearchParams(location.search).get('dev')||''}));$('menu').classList.add('hide')}
+function startGame(){ws&&ws.readyState===1?join():connect()}
+function over(s){my=0;floor=0;kills=-1;E.clear();AR=[];WL=[];g.fillStyle='#0f1a19';g.fillRect(0,0,W,H);$('mt').textContent='Out of lives after 5 knockouts. Best floor: '+s.best+'.';$('play').textContent='Play again';$('menu').classList.remove('hide')}
 function connect(){
   ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host);
-  ws.onopen=()=>{ws.send(JSON.stringify({t:'join',name:$('nm').value||'player',key:new URLSearchParams(location.search).get('dev')||''}));$('menu').classList.add('hide')};
-  ws.onmessage=m=>{const s=JSON.parse(m.data);s.t==='hello'?hello(s):snap(s)};
+  ws.onopen=join;
+  ws.onmessage=m=>{const s=JSON.parse(m.data);s.t==='hello'?hello(s):s.t==='over'?over(s):snap(s)};
   ws.onclose=()=>{my=0;$('mt').textContent='Disconnected from the server.';$('play').textContent='Reconnect';$('menu').classList.remove('hide')};
 }
 function snap(s){
   my=s.id;
   if(s.fl!==floor){if(floor)banner(s.fl>floor?'Floor '+s.fl:'Back to floor '+s.fl);floor=s.fl;E.clear()}
   if(s.k!==kills||s.fl!==floor){kills=s.k}
-  hud();dcd=s.dcd;dm=s.dm;
+  lives=s.lv;cw=s.cw;hud();dcd=s.dcd;dm=s.dm;
   const seen=new Set();
   for(const q of s.p){
     seen.add(q[0]);let e=E.get(q[0]);if(!e){e={x:q[1],y:q[2]};E.set(q[0],e)}
@@ -92,7 +95,7 @@ function draw(dt){
   for(const q of WL){g.fillStyle='rgba(0,0,0,.35)';g.fillRect(q[0]+4,q[1]+6,q[2],q[3]);g.fillStyle=`hsl(${hue} 22% 62%)`;g.fillRect(q[0],q[1],q[2],q[3]);g.strokeStyle='#f3efe2';g.lineWidth=3;g.strokeRect(q[0],q[1],q[2],q[3])}
   g.lineCap='round';
   const da=(performance.now()-arT)/1000;
-  for(const a of AR){const x=a[0]+a[2]*da,y=a[1]+a[3]*da;g.strokeStyle=a[4]===my?'#fff':'#ffd9a0';g.lineWidth=3;g.beginPath();g.moveTo(x,y);g.lineTo(x-a[2]*.025,y-a[3]*.025);g.stroke()}
+  for(const a of AR){const x=a[0]+a[2]*da,y=a[1]+a[3]*da;g.strokeStyle=a[5]?'#ff9a3c':a[4]===my?'#fff':'#ffd9a0';g.lineWidth=a[5]?5:3;g.beginPath();g.moveTo(x,y);g.lineTo(x-a[2]*.025,y-a[3]*.025);g.stroke()}
   for(const [id,e] of E){
     if(e.dash){g.globalAlpha=.35}
     g.fillStyle=`hsl(${e.hue} 75% 55%)`;g.beginPath();g.arc(e.x,e.y,18,0,6.28);g.fill();g.globalAlpha=1;
@@ -108,7 +111,7 @@ function draw(dt){
 function loop(t){
   const dt=Math.min(.05,(t-last)/1000||0);last=t;
   for(const p of fx){p.x+=p.vx*dt;p.y+=p.vy*dt;p.l-=dt}fx=fx.filter(p=>p.l>0);shake=Math.max(0,shake-dt*30);
-  $('db').style.width=((dm>0?Math.max(0,1-dcd/dm):1)*100)+'%';{const m=E.get(my);$('pb').style.width=((m&&m.ch||0)*100)+'%'}$('dt').textContent=dcd>0?'Dash recharging':'Dash ready · Space';
+  $('db').style.width=((dm>0?Math.max(0,1-dcd/dm):1)*100)+'%';{const m=E.get(my);$('pb').style.width=((m&&m.ch||0)*100)+'%'}$('dt').textContent=cw>0?'Curve window: flick and fire!':dcd>0?'Dash recharging':'Dash ready · Space';
   draw(dt);requestAnimationFrame(loop);
 }
 setInterval(()=>{if(ws&&ws.readyState===1&&my){const dx=mouse.x-W/2,dy=mouse.y-H/2;ws.send(JSON.stringify({t:'in',a:Math.atan2(dy,dx),d:Math.hypot(dx,dy),f:down}))}},33);
@@ -116,16 +119,16 @@ addEventListener('pointermove',e=>{mouse.x=e.clientX;mouse.y=e.clientY});
 addEventListener('pointerdown',e=>{if(e.target.closest('#menu,#dev,#devbtn'))return;mouse.x=e.clientX;mouse.y=e.clientY;down=true});
 addEventListener('pointerup',()=>down=false);
 addEventListener('keydown',e=>{if(e.code==='Backquote'&&!$('devbtn').classList.contains('hide')){e.preventDefault();$('dev').classList.toggle('hide');return}
-  if(e.target.tagName==='INPUT'){if(e.key==='Enter'&&e.target.id==='nm')connect();return}if(e.code==='Space'){e.preventDefault();if(ws&&ws.readyState===1)ws.send('{"t":"dash"}')}});
-$('mt').textContent='Move with your mouse. Hold click to draw your bow and release to fire: the longer the draw, the faster the arrow. Space to dash. Get 5 kills to climb; get knocked out and you drop a floor.';
+  if(e.target.tagName==='INPUT'){if(e.key==='Enter'&&e.target.id==='nm')startGame();return}if(e.code==='Space'){e.preventDefault();if(ws&&ws.readyState===1)ws.send('{"t":"dash"}')}});
+$('mt').textContent='Move with your mouse. Hold click to draw your bow and release to fire: the longer the draw, the faster the arrow. Space to dash. Get 3 kills to climb. Each knockout drops you a floor, and 5 knockouts send you home. Dash, then flick your aim and fire to curve an arrow.';
 const send=o=>ws&&ws.readyState===1&&ws.send(JSON.stringify(o));
-const DEF={maxCharge:2,minSpd:400,maxSpd:1400,speed:290,dashCd:1.6};
+const DEF={maxCharge:.4,minSpd:400,maxSpd:1400,speed:290,dashCd:1.6,curveWin:1,curveK:1};
 function hello(s){if(!s.dev)return;$('devbtn').classList.remove('hide');if($('dev').childElementCount<2)buildDev()}
 function buildDev(){
   const dev=$('dev'),rows=[];
   const row=(label,min,max,step,val,fn)=>{const l=document.createElement('label'),v=document.createElement('span');v.textContent=val;l.append(label,v);
     const i=document.createElement('input');i.type='range';i.min=min;i.max=max;i.step=step;i.value=val;i.oninput=()=>{v.textContent=i.value;fn(+i.value)};dev.append(l,i);return [i,v]};
-  for(const [k,label,min,max,step] of [['maxCharge','Max draw time (s)',.2,5,.1],['minSpd','Slowest arrow (px/s)',100,2000,50],['maxSpd','Fastest arrow (px/s)',200,3000,50],['speed','Player speed',100,900,10],['dashCd','Dash cooldown (s)',0,5,.1]])
+  for(const [k,label,min,max,step] of [['maxCharge','Max draw time (s)',.1,5,.1],['minSpd','Slowest arrow (px/s)',100,2000,50],['maxSpd','Fastest arrow (px/s)',200,3000,50],['speed','Player speed',100,900,10],['dashCd','Dash cooldown (s)',0,5,.1],['curveWin','Curve window after dash (s)',0,3,.1],['curveK','Curve strength x',0,3,.1]])
     rows.push([k,...row(label,min,max,step,DEF[k],v=>send({t:'cfg',k,v}))]);
   row('Bots on this floor (-1 = auto)',-1,40,1,-1,v=>send({t:'bots',v}));
   const gl=document.createElement('label');gl.textContent='Go to floor ';
@@ -139,7 +142,7 @@ function buildDev(){
   const sm=document.createElement('small');sm.textContent='Changes apply to you only. Press ` to open or close.';dev.append(sm);
 }
 $('devbtn').onclick=()=>$('dev').classList.toggle('hide');
-$('play').onclick=connect;
+$('play').onclick=startGame;
 requestAnimationFrame(loop);
 </script>
 </body></html>
