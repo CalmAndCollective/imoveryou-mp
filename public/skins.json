@@ -1,0 +1,10 @@
+{"skins":[
+{"id":"classic","name":"Classic","price":0,"style":{}},
+{"id":"mint","name":"Mint","price":100,"style":{"fill":"#6fe3b0"}},
+{"id":"sunset","name":"Sunset","price":200,"style":{"fill":"#ff8a4c","ring":"#ffe0a0"}},
+{"id":"bandit","name":"Bandit","price":300,"style":{"fill":"#444b57","stripe":"#e8e8e8"}},
+{"id":"target","name":"Bullseye","price":400,"style":{"fill":"#f3efe2","ring":"#e84a3c"}},
+{"id":"royal","name":"Royal","price":600,"style":{"fill":"#6a4cff","ring":"#ffd34a"}},
+{"id":"ghost","name":"Ghost","price":800,"style":{"fill":"#dfe9f5","alpha":0.7}},
+{"id":"gold","name":"Golden","price":1500,"style":{"fill":"#ffcf33","ring":"#fff1b0"}}
+]}
