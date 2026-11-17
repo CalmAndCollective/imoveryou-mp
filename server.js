@@ -112,7 +112,7 @@ wss.on('connection',ws=>{
     if(d.t==='buy'){const s=SK.get(String(d.id)),x=prof(p);if(!s||x.owned.includes(String(d.id))||x.points<s.price)return;x.points-=s.price;x.owned.push(String(d.id));dirty=true;sendProf(p);return}
     if(d.t==='equip'){const x=prof(p),id=String(d.id);if(!x.owned.includes(id))return;x.skin=id;p.skin=id;dirty=true;sendProf(p);return}
     if(!p.floor)return;
-    if(d.t==='in'){const na=num(d.a,0,7);if(!p.gi){p.gi=1;p.pa=na}p.a=na;p.ma=na;p.d=Math.max(0,num(d.d,0));p.fire=!!d.f}
+    if(d.t==='in'){const na=num(d.a,0,7);if(!p.gi){p.gi=1;p.pa=na}p.a=na;p.ma=d.m===undefined?na:num(d.m,0,7);p.d=Math.max(0,num(d.d,0));p.fire=!!d.f}
     else if(d.t==='dash')doDash(p);
     else if(!p.dev)return;
     else if(d.t==='cfg'){if(d.k==='god'||d.k==='selfHit')p.c[d.k]=!!d.v;else if(LIM[d.k])p.c[d.k]=cl(d.v,LIM[d.k],DEF[d.k])}
