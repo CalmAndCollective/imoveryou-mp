@@ -5,7 +5,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;800&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#0f1a19;--fg:#f3efe2;--hot:#ff5a3c;--dim:#9db3ad;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
-html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:"Bricolage Grotesque",system-ui,sans-serif;overflow:hidden;cursor:crosshair;user-select:none}
+html,body{height:100%;margin:0;touch-action:none;-webkit-touch-callout:none;background:var(--bg);color:var(--fg);font-family:"Bricolage Grotesque",system-ui,sans-serif;overflow:hidden;cursor:crosshair;user-select:none}
 canvas#c{position:fixed;inset:0;display:block}
 .hud{position:fixed;left:16px;top:calc(12px + env(safe-area-inset-top,0px));pointer-events:none}
 .floor{font-weight:800;font-size:34px;line-height:1}
@@ -46,12 +46,25 @@ button:focus-visible,input:focus-visible{outline:3px solid var(--fg);outline-off
 .dev input[type=range]{width:100%}
 .dev input[type=number]{width:64px;font:inherit;padding:4px;border-radius:4px;border:1px solid var(--dim);background:var(--bg);color:var(--fg)}
 .dev button{font-size:13px;padding:6px 12px;margin:8px 6px 0 0}.dev small{display:block;margin-top:10px;color:var(--dim)}
+.stick{position:fixed;width:120px;height:120px;border-radius:50%;border:2px solid rgba(243,239,226,.45);background:rgba(243,239,226,.08);pointer-events:none;z-index:4}
+.stick i{position:absolute;left:50%;top:50%;width:52px;height:52px;margin:-26px;border-radius:50%;background:rgba(243,239,226,.5)}
+.dashbtn{position:fixed;right:22px;bottom:calc(130px + env(safe-area-inset-bottom,0px));width:88px;height:88px;border-radius:50%;padding:0;font-size:16px;z-index:4;touch-action:none}
+.thint{position:fixed;left:0;right:0;bottom:calc(60px + env(safe-area-inset-bottom,0px));display:flex;justify-content:space-between;padding:0 24px;font-size:12px;color:var(--dim);pointer-events:none;opacity:.8}
+.card p{margin:0;font-size:14px;line-height:1.45;color:var(--dim);text-align:left}
+.card b{font-size:16px}
 @media (prefers-reduced-motion:reduce){.banner.go{animation:none}}
 </style></head><body>
 <canvas id="c"></canvas>
 <div class="hud"><div class="floor" id="fl">Floor 1</div><div class="pips" id="pips"></div><div class="sub" id="lv"></div><div class="sub" id="pt"></div></div>
 <div class="lb" id="lb"></div>
 <div class="dash"><div class="bar" style="margin:0 0 8px"><b id="pb" style="background:var(--hot);width:0"></b></div><span id="dt">Dash ready · Space</span><div class="bar"><b id="db"></b></div></div>
+<div class="stick hide" id="stL"><i></i></div><div class="stick hide" id="stR"><i></i></div>
+<button class="dashbtn hide" id="dashbtn">DASH</button>
+<div class="thint hide" id="thint"><span>MOVE</span><span>AIM: hold to draw, release to fire</span></div>
+<div class="shop hide" id="howto"><h1 style="margin:0">How to play</h1><div class="grid" id="howgrid" style="grid-template-columns:repeat(auto-fill,minmax(260px,1fr))"></div><button class="alt" id="howx">Back</button></div>
+<div class="shop hide" id="settings"><h1 style="margin:0">Settings</h1><button class="alt" id="joybtn"></button>
+  <p class="sub" style="max-width:44ch;font-size:14px;line-height:1.5">Joystick on: touch the left half of the screen to move, touch the right half to aim (hold to draw the bow, let go to fire), and use the DASH button. Off: touch and drag to steer toward your finger, hold to draw.</p>
+  <button class="alt" id="setx">Back</button></div>
 <div class="banner" id="bn"></div>
 <button class="devbtn hide" id="devbtn">Test panel</button>
 <div class="dev hide" id="dev"><h2>Test panel</h2></div>
@@ -60,6 +73,7 @@ button:focus-visible,input:focus-visible{outline:3px solid var(--fg);outline-off
   <p id="mt"></p>
   <input id="nm" maxlength="12" placeholder="Your name">
   <div class="row"><button id="play">Play</button><button class="alt" id="shopbtn">Skins shop</button></div>
+  <div class="row"><button class="alt" id="howbtn">How to play</button><button class="alt" id="setbtn">Settings</button></div>
   <div class="sub" id="mpts"></div>
 </div>
 <div class="shop hide" id="shop">
@@ -98,7 +112,7 @@ function banner(t){const b=$('bn');clearTimeout(bt);b.textContent=t;b.classList.
 function burst(x,y,h,n){for(let i=0;i<n;i++){const a=R(0,6.28),s=R(80,380);fx.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,l:R(.3,.7),h})}}
 function menuText(t){$('mt').textContent=t}
 function showMenu(){$('menu').classList.remove('hide');$('mpts').textContent='Points: '+prof.points}
-menuText('Move with your mouse. Hold click to draw your bow and release to fire: the longer the draw, the faster the arrow. Space to dash. Dash, then flick your aim and fire to curve an arrow. Earn points with kills and spend them in the shop.');
+menuText('Hold click to draw your bow and release to fire. Space to dash. New here? Tap How to play.');
 fetch('skins.json').then(r=>r.json()).then(j=>{SKL=j.skins;SK=Object.fromEntries(SKL.map(s=>[s.id,s]));renderShop()}).catch(()=>{});
 function renderShop(){
   $('spts').textContent='Your points: '+prof.points;$('mpts').textContent='Points: '+prof.points;
@@ -191,12 +205,17 @@ function loop(t){
   for(const p of fx){p.x+=p.vx*dt;p.y+=p.vy*dt;p.l-=dt}fx=fx.filter(p=>p.l>0);shake=Math.max(0,shake-dt*30);
   $('db').style.width=((dm>0?Math.max(0,1-dcd/dm):1)*100)+'%';{const m=E.get(my);$('pb').style.width=((m&&m.ch||0)*100)+'%'}
   $('dt').textContent=cw>0?'Curve window: flick and fire!':dcd>0?'Dash recharging':'Dash ready · Space';
+  {const on=joy&&my>0;$('dashbtn').classList.toggle('hide',!on);$('dashbtn').style.opacity=dcd>0?.4:1;$('thint').classList.toggle('hide',!on||touched);
+   if(!my){$('stL').classList.add('hide');$('stR').classList.add('hide');tl=ta=null;aiming=false;moveM=0}}
   draw(dt);requestAnimationFrame(loop);
 }
-setInterval(()=>{if(my){const dx=mouse.x-W/2,dy=mouse.y-H/2;send({t:'in',a:Math.atan2(dy,dx),d:Math.hypot(dx,dy),f:down})}},33);
-addEventListener('pointermove',e=>{mouse.x=e.clientX;mouse.y=e.clientY});
-addEventListener('pointerdown',e=>{if(e.target.closest('#menu,#shop,#dev,#devbtn'))return;mouse.x=e.clientX;mouse.y=e.clientY;down=true});
-addEventListener('pointerup',()=>down=false);
+setInterval(()=>{if(!my)return;
+  if(joy){const now=performance.now();if(aiming)faceA=aimA;else if(now>aimLock&&moveM>0)faceA=moveA;
+    send({t:'in',a:faceA,d:moveM*90,m:moveA,f:aiming||now<fireUntil});return}
+  const dx=mouse.x-W/2,dy=mouse.y-H/2;send({t:'in',a:Math.atan2(dy,dx),d:Math.hypot(dx,dy),f:down})},33);
+addEventListener('pointermove',e=>{mouse.x=e.clientX;mouse.y=e.clientY;if(joy)joyMove(e)});
+addEventListener('pointerdown',e=>{if(e.target.closest(UI))return;if(joy){joyDown(e);return}mouse.x=e.clientX;mouse.y=e.clientY;down=true});
+addEventListener('pointerup',e=>{down=false;joyUp(e)});addEventListener('pointercancel',joyUp);
 addEventListener('keydown',e=>{
   if(e.code==='Backquote'&&!$('devbtn').classList.contains('hide')){e.preventDefault();$('dev').classList.toggle('hide');return}
   if(e.target.tagName==='INPUT'){if(e.key==='Enter'&&e.target.id==='nm')startGame();return}
@@ -232,6 +251,44 @@ function buildDev(){
   const sm=document.createElement('small');sm.textContent='Your settings affect you only. Bot difficulty affects everyone on the server. Press ` to open or close.';dev.append(sm);
 }
 $('devbtn').onclick=()=>$('dev').classList.toggle('hide');
+
+// ---------- tutorial + settings ----------
+const TUT=[['Your goal','Win fights to climb floors. Get 3 kills on a floor to move up. Each knockout drops you one floor, and after 5 knockouts your run ends. Try to top the leaderboard.'],
+['Moving','Mouse: your archer moves toward the cursor, and the farther away the cursor is, the faster you go. Touch: turn on the joystick in Settings. Left side of the screen moves, right side aims.'],
+['Shooting','Hold left click (or hold on the right side of the screen) to draw your bow, then let go to fire. A longer draw means a faster arrow that flies farther. A full draw takes about half a second.'],
+['Dashing','Press Space (or the DASH button) for a quick dash in the direction you are moving. You cannot be hit while you dash. It needs a moment to recharge.'],
+['Curve shots','Dash, then quickly swing your aim sideways and fire within about a second. The arrow bends the way you swung, and a faster swing makes a sharper curve. Curved arrows are orange.'],
+['Walls and bounces','From floor 2 there are walls. Arrows bounce off them like billiard balls, so you can bank shots around corners. Careful: your own bounced arrow can hit you too.'],
+['Bots and players','Grey names are bots, and they get tougher on higher floors. Coloured names are real players. Both count as kills, but beating real players earns more points.'],
+['Points and skins','Kills and climbing floors earn points. Spend them in the Skins shop on the home screen to change how your archer looks.']];
+for(const [t,x] of TUT){const c=document.createElement('div');c.className='card';const b=document.createElement('b'),p=document.createElement('p');b.textContent=t;p.textContent=x;c.append(b,p);$('howgrid').appendChild(c)}
+$('howbtn').onclick=()=>$('howto').classList.remove('hide');$('howx').onclick=()=>$('howto').classList.add('hide');
+let joy=ls('iov_joy');joy=joy===null||joy===undefined?matchMedia('(pointer:coarse)').matches:joy==='1';   // on by default for touch screens
+const joyLabel=()=>{$('joybtn').textContent='Touch joystick: '+(joy?'On':'Off')};
+$('joybtn').onclick=()=>{joy=!joy;ls('iov_joy',joy?'1':'0');joyLabel()};
+$('setbtn').onclick=()=>{joyLabel();$('settings').classList.remove('hide')};$('setx').onclick=()=>$('settings').classList.add('hide');
+// ---------- touch joystick: left half = move, right half = aim/draw/fire ----------
+const SR=60,UI='#menu,#shop,#dev,#devbtn,#dashbtn,#howto,#settings';
+let tl=null,ta=null,moveM=0,moveA=0,aimA=0,faceA=0,aiming=false,aimLock=0,fireUntil=0,touched=false;
+const place=(el,x,y)=>{el.style.left=(x-60)+'px';el.style.top=(y-60)+'px';el.classList.remove('hide')};
+const knob=(el,dx,dy)=>{el.firstChild.style.transform=`translate(${dx}px,${dy}px)`};
+function joyDown(e){
+  if(!my)return;touched=true;
+  if(e.clientX<W/2&&!tl){tl={id:e.pointerId,x:e.clientX,y:e.clientY};place($('stL'),tl.x,tl.y);knob($('stL'),0,0)}
+  else if(e.clientX>=W/2&&!ta){ta={id:e.pointerId,x:e.clientX,y:e.clientY};aimA=faceA;aiming=true;fireUntil=performance.now()+80;place($('stR'),ta.x,ta.y);knob($('stR'),0,0)}
+}
+function joyMove(e){
+  for(const [s,el] of [[tl,'stL'],[ta,'stR']]){
+    if(!s||e.pointerId!==s.id)continue;
+    const dx=e.clientX-s.x,dy=e.clientY-s.y,l=Math.hypot(dx,dy),k=l>SR?SR/l:1;knob($(el),dx*k,dy*k);
+    if(s===tl){moveM=l>8?Math.min(1,l/SR):0;if(l>8)moveA=Math.atan2(dy,dx)}else if(l>14)aimA=Math.atan2(dy,dx);
+  }
+}
+function joyUp(e){
+  if(tl&&e.pointerId===tl.id){tl=null;moveM=0;$('stL').classList.add('hide')}
+  if(ta&&e.pointerId===ta.id){ta=null;aiming=false;aimLock=performance.now()+250;$('stR').classList.add('hide')}   // keep the aim for a moment so the shot goes where you aimed
+}
+$('dashbtn').addEventListener('pointerdown',e=>{e.preventDefault();send({t:'dash'})});
 $('play').onclick=startGame;
 connect();requestAnimationFrame(loop);
 </script>
