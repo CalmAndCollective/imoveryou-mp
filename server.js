@@ -1,6 +1,6 @@
 // imoveryou.io server (alpha): floors = rooms, server-side bots, bow draw-back, curve shots, walls, points + skins.
 // Run: npm install && npm start.  Test panel: open the game with ?dev=YOUR_KEY (set DEV_KEY env var on Render).
-const http=require('http'),fs=require('fs'),path=require('path');
+const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
 const {WebSocketServer}=require('ws');
 const A=2400,TICK=30,DT=1/TICK,PORT=process.env.PORT||3000,DEV_KEY=process.env.DEV_KEY||'devtest';
 const PTS={kill:20,bot:5,floor:30};                       // points earned per player kill / bot kill / floor climbed
@@ -12,7 +12,7 @@ const PRESETS={easy:{aimErr:.8,speed:90,reload:1.8,sight:450,dash:.1,dmg:.5,floo
 const BLIM={aimErr:[0,1.5],speed:[40,300],reload:[.25,4],sight:[200,900],dash:[0,1],dmg:[.1,1.5],floorScale:[0,2]};
 const BD={...PRESETS.normal};
 // ---- static files ----
-const PUB=path.join(__dirname,'public'),MIME={'.html':'text/html; charset=utf-8','.json':'application/json','.png':'image/png','.jpg':'image/jpeg','.webp':'image/webp','.svg':'image/svg+xml'};
+const PUB=path.join(__dirname,'public'),MIME={'.html':'text/html; charset=utf-8','.json':'application/json','.js':'text/javascript','.webmanifest':'application/manifest+json','.png':'image/png','.jpg':'image/jpeg','.webp':'image/webp','.svg':'image/svg+xml'};
 const srv=http.createServer((q,r)=>{
   let u;try{u=decodeURIComponent((q.url||'/').split('?')[0])}catch{r.writeHead(400);return r.end()}
   if(u==='/')u='/index.html';
@@ -21,16 +21,61 @@ const srv=http.createServer((q,r)=>{
   fs.readFile(f,(e,d)=>{r.writeHead(e?404:200,{'Content-Type':MIME[path.extname(f)],'Cache-Control':'no-cache'});r.end(e?undefined:d)});
 });
 const wss=new WebSocketServer({server:srv});
-// ---- skins + player profiles (points, owned skins). Stored in data.json: free Render resets it on redeploy; use a database later. ----
+// ---- skins ----
 let SK=new Map([['classic',{price:0}]]);
 try{for(const s of JSON.parse(fs.readFileSync(path.join(PUB,'skins.json'))).skins)SK.set(String(s.id),{price:Math.max(0,+s.price||0)})}catch{}
-const DATA=path.join(process.env.DATA_DIR||__dirname,'data.json');
-let profiles={};try{profiles=JSON.parse(fs.readFileSync(DATA))}catch{}
-let dirty=false;const save=()=>{if(dirty){dirty=false;try{fs.writeFileSync(DATA,JSON.stringify(profiles))}catch{}}};
-setInterval(save,10000);process.on('SIGTERM',()=>{save();process.exit(0)});
-const prof=p=>profiles[p.token]||(profiles[p.token]={points:0,owned:['classic'],skin:'classic'});
-const give=(p,n)=>{if(!p.bot&&p.token){prof(p).points+=n;dirty=true}};
-const sendProf=p=>{const x=prof(p);p.ws.send(JSON.stringify({t:'prof',points:x.points,owned:x.owned,skin:x.skin,dev:p.dev}))};
+// ---- storage: Postgres when DATABASE_URL is set (accounts survive restarts); otherwise a JSON file for local testing only ----
+const sha=x=>crypto.createHash('sha256').update(x).digest('hex');
+const DEFPROF=()=>({points:0,owned:['classic'],skin:'classic'});
+let store;
+if(process.env.DATABASE_URL){
+  const {Pool}=require('pg');
+  const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_SSL==='off'?false:{rejectUnauthorized:false},max:5});
+  store={
+    async init(){await pool.query(`create table if not exists accounts(id serial primary key,email text unique not null,name text not null,hash text not null,created timestamptz default now());
+      create table if not exists sessions(hash text primary key,account_id int not null references accounts(id) on delete cascade,created timestamptz default now());
+      create table if not exists profiles(owner text primary key,points int not null default 0,owned jsonb not null default '["classic"]',skin text not null default 'classic',updated timestamptz default now())`)},
+    async account(email){return (await pool.query('select id,email,name,hash from accounts where email=$1',[email])).rows[0]||null},
+    async createAccount(email,name,hash){return (await pool.query('insert into accounts(email,name,hash) values($1,$2,$3) returning id',[email,name,hash])).rows[0].id},   // duplicate email throws code 23505
+    async session(tok){return (await pool.query("select a.id,a.email,a.name from sessions s join accounts a on a.id=s.account_id where s.hash=$1 and s.created>now()-interval '90 days'",[sha(tok)])).rows[0]||null},
+    async newSession(id,tok){await pool.query('insert into sessions(hash,account_id) values($1,$2)',[sha(tok),id])},
+    async delSession(tok){await pool.query('delete from sessions where hash=$1',[sha(tok)])},
+    async deleteAccount(id){await pool.query('delete from profiles where owner=$1',['a:'+id]);await pool.query('delete from accounts where id=$1',[id])},
+    async loadProfile(o){const r=(await pool.query('select points,owned,skin from profiles where owner=$1',[o])).rows[0];return r?{points:r.points,owned:r.owned,skin:r.skin}:null},
+    async saveProfiles(l){for(const [o,p] of l)await pool.query('insert into profiles(owner,points,owned,skin) values($1,$2,$3,$4) on conflict(owner) do update set points=$2,owned=$3,skin=$4,updated=now()',[o,p.points,JSON.stringify(p.owned),p.skin])},
+  };
+}else{
+  const F=path.join(process.env.DATA_DIR||__dirname,'data.json');let D={accounts:[],sessions:{},profiles:{}};
+  try{const raw=JSON.parse(fs.readFileSync(F));if(raw.accounts)D={...D,...raw};else for(const k in raw)D.profiles['g:'+k]=raw[k]}catch{}
+  const flush=()=>{try{fs.writeFileSync(F,JSON.stringify(D))}catch{}};
+  store={
+    async init(){console.log('No DATABASE_URL set: using data.json (on Render free this resets on redeploy)')},
+    async account(e){return D.accounts.find(a=>a.email===e)||null},
+    async createAccount(e,n,h){if(D.accounts.some(a=>a.email===e)){const x=new Error('dup');x.code='23505';throw x}const id=D.accounts.reduce((m,a)=>Math.max(m,a.id),0)+1;D.accounts.push({id,email:e,name:n,hash:h});flush();return id},
+    async session(t){const id=D.sessions[sha(t)],a=id&&D.accounts.find(a=>a.id===id);return a?{id:a.id,email:a.email,name:a.name}:null},
+    async newSession(id,t){D.sessions[sha(t)]=id;flush()},
+    async delSession(t){delete D.sessions[sha(t)];flush()},
+    async deleteAccount(id){D.accounts=D.accounts.filter(a=>a.id!==id);for(const k in D.sessions)if(D.sessions[k]===id)delete D.sessions[k];delete D.profiles['a:'+id];flush()},
+    async loadProfile(o){return D.profiles[o]?JSON.parse(JSON.stringify(D.profiles[o])):null},
+    async saveProfiles(l){for(const [o,p] of l)D.profiles[o]=JSON.parse(JSON.stringify(p));flush()},
+  };
+}
+// Profiles are cached in memory while a player is connected and written back every 10 s (and on leave / shutdown).
+const cache=new Map(),dirtyP=new Set();
+async function getProfile(o){let p=cache.get(o);if(!p){p=(await store.loadProfile(o))||DEFPROF();cache.set(o,p)}return p}
+async function flushProfiles(){if(!dirtyP.size)return;const l=[...dirtyP].filter(o=>cache.has(o)).map(o=>[o,cache.get(o)]);dirtyP.clear();try{await store.saveProfiles(l)}catch(e){console.error('save failed:',e.message);for(const [o] of l)dirtyP.add(o)}}
+setInterval(flushProfiles,10000);process.on('SIGTERM',async()=>{await flushProfiles();process.exit(0)});
+async function release(o,ws){if(!o||[...(wss.clients||[])].some(c=>c!==ws&&c.p&&c.p.owner===o))return;await flushProfiles();cache.delete(o)}
+const prof=p=>cache.get(p.owner);
+const give=(p,n)=>{if(!p.bot&&p.owner&&cache.has(p.owner)){prof(p).points+=n;dirtyP.add(p.owner)}};
+const sendProf=p=>{const x=prof(p);p.ws.send(JSON.stringify({t:'prof',points:x.points,owned:x.owned,skin:x.skin,dev:p.dev,acct:p.acct?{name:p.acct.name,email:p.acct.email}:null}))};
+// ---- passwords (scrypt) + login rate limit ----
+const scrypt=(pw,salt)=>new Promise((res,rej)=>crypto.scrypt(pw,salt,64,(e,k)=>e?rej(e):res(k)));
+const hashPw=async pw=>{const s=crypto.randomBytes(16);return s.toString('hex')+'$'+(await scrypt(pw,s)).toString('hex')};
+const checkPw=async(pw,h)=>{const [s,k]=String(h).split('$'),d=await scrypt(pw,Buffer.from(s,'hex')),e=Buffer.from(k,'hex');return d.length===e.length&&crypto.timingSafeEqual(d,e)};
+const RL=new Map();
+const limited=(ip,max=20,win=600000)=>{const n=Date.now();let r=RL.get(ip);if(!r||n-r.t>win){r={t:n,c:0};RL.set(ip,r)}return ++r.c>max};
+setInterval(()=>{const n=Date.now();for(const [k,r] of RL)if(n-r.t>600000)RL.delete(k)},60000);
 // ---- game ----
 const rooms=new Map();let nid=1,lb=[],lbT=0;
 const R=(a,b)=>a+Math.random()*(b-a);
@@ -44,7 +89,7 @@ function wallsFor(f){   // none on floor 1; pinwheel of bars from floor 2; corne
 }
 const hitWall=(w,x,y,m=2)=>w.some(q=>x>=q.x-m&&x<=q.x+q.w+m&&y>=q.y-m&&y<=q.y+q.h+m);
 const room=f=>{let r=rooms.get(f);if(!r){r={f,ps:new Map(),ar:[],ev:[],bo:undefined,w:wallsFor(f)};rooms.set(f,r)}return r};
-const mkEnt=o=>Object.assign({a:0,ma:0,d:0,fire:false,dcd:0,dash:0,charge:0,charging:false,rec:0,hp:100,kills:0,tk:0,vx:0,vy:0,spd:290,c:{...DEF},floor:0,bot:false,av:0,pa:0,cwl:0,deaths:0,best:1,gi:0,skin:'classic',token:null},o);
+const mkEnt=o=>Object.assign({a:0,ma:0,d:0,fire:false,dcd:0,dash:0,charge:0,charging:false,rec:0,hp:100,kills:0,tk:0,vx:0,vy:0,spd:290,c:{...DEF},floor:0,bot:false,av:0,pa:0,cwl:0,deaths:0,best:1,gi:0,skin:'classic',token:null,owner:null,acct:null,session:null},o);
 function spawnPos(r){for(let i=0;i<60;i++){const x=R(150,A-150),y=R(150,A-150);if(!hitWall(r.w,x,y,50))return[x,y]}return[150,150]}
 function pushOut(p,w){
   for(const q of w){
@@ -97,34 +142,81 @@ function botAI(b,r){
     if(b.hp<50&&Math.random()<DT*BD.dash)doDash(b);
   }else{b.fire=false;b.wt-=DT;if(b.wt<=0){b.wt=R(1,3);b.ma=R(0,6.28);b.a=b.ma}b.d=60}
 }
-wss.on('connection',ws=>{
+wss.on('connection',(ws,req)=>{
   const p=mkEnt({id:nid++,ws,name:'player',hue:Math.round(R(0,360)),dev:false});ws.p=p;
-  ws.on('message',m=>{
-    if(m.length>300)return;
+  p.ip=((req&&req.headers['x-forwarded-for'])||'').split(',')[0].trim()||(req&&req.socket.remoteAddress)||'?';
+  const err=m=>ws.send(JSON.stringify({t:'acct',err:m}));
+  const bind=async(acct,session)=>{const old=p.owner;p.acct=acct;p.session=session;p.owner=acct?'a:'+acct.id:'g:'+p.token;await getProfile(p.owner);p.skin=prof(p).skin;return old};
+  ws.on('message',async m=>{
+    if(m.length>400)return;
     let d;try{d=JSON.parse(m)}catch{return}
-    if(d.t==='auth'){
-      const t=String(d.token||'');if(p.token||!/^[\w-]{16,64}$/.test(t))return;
-      p.token=t;p.dev=String(d.key||'')===DEV_KEY;p.skin=prof(p).skin;sendProf(p);
-      if(p.dev)ws.send(JSON.stringify({t:'bd',v:BD}));return;
-    }
-    if(!p.token)return;
-    if(d.t==='join'){if(p.floor)return;p.name=String(d.name||'player').slice(0,12);p.skin=prof(p).skin;p.deaths=0;p.best=1;p.kills=0;p.tk=0;place(p,1);return}
-    if(d.t==='buy'){const s=SK.get(String(d.id)),x=prof(p);if(!s||x.owned.includes(String(d.id))||x.points<s.price)return;x.points-=s.price;x.owned.push(String(d.id));dirty=true;sendProf(p);return}
-    if(d.t==='equip'){const x=prof(p),id=String(d.id);if(!x.owned.includes(id))return;x.skin=id;p.skin=id;dirty=true;sendProf(p);return}
-    if(!p.floor)return;
-    if(d.t==='in'){const na=num(d.a,0,7);if(!p.gi){p.gi=1;p.pa=na}p.a=na;p.ma=d.m===undefined?na:num(d.m,0,7);p.d=Math.max(0,num(d.d,0));p.fire=!!d.f}
-    else if(d.t==='dash')doDash(p);
-    else if(!p.dev)return;
-    else if(d.t==='cfg'){if(d.k==='god'||d.k==='selfHit')p.c[d.k]=!!d.v;else if(LIM[d.k])p.c[d.k]=cl(d.v,LIM[d.k],DEF[d.k])}
-    else if(d.t==='floor')place(p,Math.max(1,Math.min(99,Math.round(num(d.v,1)))));
-    else if(d.t==='bots'){const n=Math.round(num(d.v,-1,100));room(p.floor).bo=n<0?undefined:Math.min(40,n)}
-    else if(d.t==='bd'||d.t==='bdpreset'){
-      if(d.t==='bd'&&Object.hasOwn(BLIM,d.k))BD[d.k]=cl(d.v,BLIM[d.k],BD[d.k]);
-      if(d.t==='bdpreset'&&Object.hasOwn(PRESETS,d.v))Object.assign(BD,PRESETS[d.v]);
-      for(const c of wss.clients||[])if(c.p?.dev&&c.readyState===1)c.send(JSON.stringify({t:'bd',v:BD}));
-    }
+    try{
+      if(d.t==='auth'){
+        const t=String(d.token||'');if(p.token||!/^[\w-]{16,64}$/.test(t))return;
+        p.token=t;p.dev=String(d.key||'')===DEV_KEY;
+        let a=null;if(/^[a-f0-9]{64}$/.test(String(d.session||'')))a=await store.session(d.session);
+        await bind(a&&{id:a.id,email:a.email,name:a.name},a?d.session:null);
+        sendProf(p);if(p.dev)ws.send(JSON.stringify({t:'bd',v:BD}));return;
+      }
+      if(!p.owner)return;
+      if(d.t==='register'||d.t==='login'){
+        if(p.floor||p.busy)return;
+        if(d.t==='register'&&p.acct)return err('Sign out first.');
+        p.busy=true;
+        try{
+          if(limited(p.ip))return err('Too many attempts. Please wait a few minutes.');
+          const email=String(d.email||'').trim().toLowerCase(),pw=String(d.pass||'');
+          let acct;
+          if(d.t==='register'){
+            if(email.length>254||!/^[^\s@]{1,64}@[^\s@]+\.[^\s@]{2,}$/.test(email))return err('Please enter a valid email address.');
+            if(pw.length<8||pw.length>128)return err('Password must be 8 to 128 characters.');
+            const name=(String(d.name||'').trim()||email.split('@')[0]).slice(0,12);
+            let id;try{id=await store.createAccount(email,name,await hashPw(pw))}catch(e){if(e.code==='23505')return err('That email already has an account. Try signing in.');throw e}
+            const g=await getProfile(p.owner),ap=await getProfile('a:'+id);          // guest progress moves into the new account
+            Object.assign(ap,{points:g.points,owned:[...g.owned],skin:g.skin});Object.assign(g,DEFPROF());dirtyP.add(p.owner);dirtyP.add('a:'+id);
+            acct={id,email,name};
+          }else{
+            const a=await store.account(email);if(!a||!(await checkPw(pw,a.hash)))return err('Wrong email or password.');
+            acct={id:a.id,email:a.email,name:a.name};
+          }
+          const session=crypto.randomBytes(32).toString('hex');await store.newSession(acct.id,session);
+          const old=await bind(acct,session);ws.send(JSON.stringify({t:'acct',ok:true,session,name:acct.name}));sendProf(p);release(old,ws);
+        }finally{p.busy=false}
+        return;
+      }
+      if(d.t==='logout'){
+        if(!p.acct||p.floor||p.busy)return;p.busy=true;
+        try{await store.delSession(p.session);const old=await bind(null,null);ws.send(JSON.stringify({t:'acct',ok:true,out:true}));sendProf(p);release(old,ws)}finally{p.busy=false}
+        return;
+      }
+      if(d.t==='delacct'){   // permanent: removes the account, its sessions, points and skins
+        if(!p.acct||p.floor||p.busy)return;p.busy=true;
+        try{
+          const a=await store.account(p.acct.email);
+          if(limited(p.ip)||!a||!(await checkPw(String(d.pass||''),a.hash)))return err('Wrong password.');
+          await store.deleteAccount(a.id);const old=p.owner;cache.delete(old);dirtyP.delete(old);
+          await bind(null,null);ws.send(JSON.stringify({t:'acct',ok:true,out:true}));sendProf(p);
+        }finally{p.busy=false}
+        return;
+      }
+      if(d.t==='join'){if(p.floor)return;p.name=String(d.name||p.acct?.name||'player').slice(0,12);p.skin=prof(p).skin;p.deaths=0;p.best=1;p.kills=0;p.tk=0;place(p,1);return}
+      if(d.t==='buy'){const s=SK.get(String(d.id)),x=prof(p);if(!s||x.owned.includes(String(d.id))||x.points<s.price)return;x.points-=s.price;x.owned.push(String(d.id));dirtyP.add(p.owner);sendProf(p);return}
+      if(d.t==='equip'){const x=prof(p),id=String(d.id);if(!x.owned.includes(id))return;x.skin=id;p.skin=id;dirtyP.add(p.owner);sendProf(p);return}
+      if(!p.floor)return;
+      if(d.t==='in'){const na=num(d.a,0,7);if(!p.gi){p.gi=1;p.pa=na}p.a=na;p.ma=d.m===undefined?na:num(d.m,0,7);p.d=Math.max(0,num(d.d,0));p.fire=!!d.f}
+      else if(d.t==='dash')doDash(p);
+      else if(!p.dev)return;
+      else if(d.t==='cfg'){if(d.k==='god'||d.k==='selfHit')p.c[d.k]=!!d.v;else if(LIM[d.k])p.c[d.k]=cl(d.v,LIM[d.k],DEF[d.k])}
+      else if(d.t==='floor')place(p,Math.max(1,Math.min(99,Math.round(num(d.v,1)))));
+      else if(d.t==='bots'){const n=Math.round(num(d.v,-1,100));room(p.floor).bo=n<0?undefined:Math.min(40,n)}
+      else if(d.t==='bd'||d.t==='bdpreset'){
+        if(d.t==='bd'&&Object.hasOwn(BLIM,d.k))BD[d.k]=cl(d.v,BLIM[d.k],BD[d.k]);
+        if(d.t==='bdpreset'&&Object.hasOwn(PRESETS,d.v))Object.assign(BD,PRESETS[d.v]);
+        for(const c of wss.clients||[])if(c.p?.dev&&c.readyState===1)c.send(JSON.stringify({t:'bd',v:BD}));
+      }
+    }catch(e){console.error('message error:',e.message);try{err('Something went wrong. Please try again.')}catch{}}
   });
-  ws.on('close',()=>rooms.get(p.floor)?.ps.delete(p.id));
+  ws.on('close',()=>{rooms.get(p.floor)?.ps.delete(p.id);release(p.owner,ws)});
 });
 function tick(){
   if(++lbT%10===0)lb=[...rooms.values()].flatMap(r=>[...r.ps.values()].filter(p=>!p.bot)).sort((a,b)=>b.tk-a.tk||b.floor-a.floor).slice(0,5).map(p=>[p.id,p.name,p.tk,p.floor]);
@@ -170,11 +262,11 @@ function tick(){
     const P=[...r.ps.values()];
     const pl=P.map(p=>[p.id,Math.round(p.x),Math.round(p.y),+p.a.toFixed(2),p.hp,p.hue,p.dash>0?1:0,p.name,p.charging?+(p.charge/p.c.maxCharge).toFixed(2):0,p.bot?1:0,p.skin]);
     const wl=r.w.map(q=>[q.x,q.y,q.w,q.h]),ar=r.ar.map(a=>[Math.round(a.x),Math.round(a.y),Math.round(a.vx),Math.round(a.vy),a.o,a.w?1:0]);
-    for(const p of P)if(!p.bot&&p.ws.readyState===1)p.ws.send(JSON.stringify({t:'s',id:p.id,fl:r.f,k:p.kills,nd:p.c.need,lv:p.c.lives-p.deaths,pt:prof(p).points,dcd:Math.max(0,+p.dcd.toFixed(2)),dm:p.c.dashCd,cw:+Math.max(0,p.cwl).toFixed(2),lb,w:wl,p:pl,a:ar,e:r.ev}));
+    for(const p of P)if(!p.bot&&p.ws.readyState===1)p.ws.send(JSON.stringify({t:'s',id:p.id,fl:r.f,k:p.kills,nd:p.c.need,lv:p.c.lives-p.deaths,pt:(prof(p)||{}).points||0,dcd:Math.max(0,+p.dcd.toFixed(2)),dm:p.c.dashCd,cw:+Math.max(0,p.cwl).toFixed(2),lb,w:wl,p:pl,a:ar,e:r.ev}));
     r.ev=[];
   }
 }
 function seg(px,py,x1,y1,x2,y2){const dx=x2-x1,dy=y2-y1,l=dx*dx+dy*dy;let t=l?((px-x1)*dx+(py-y1)*dy)/l:0;t=Math.max(0,Math.min(1,t));return Math.hypot(px-(x1+dx*t),py-(y1+dy*t))}
-setInterval(tick,1000/TICK);
-if(require.main===module)srv.listen(PORT,()=>console.log('imoveryou.io on http://localhost:'+PORT));
-module.exports={rooms,tick,wss,srv,BD,profiles};
+setInterval(()=>{try{tick()}catch(e){console.error('tick error:',e)}},1000/TICK);   // one bad tick must never take the server down
+if(require.main===module)store.init().then(()=>srv.listen(PORT,()=>console.log('imoveryou.io on http://localhost:'+PORT))).catch(e=>{console.error('startup failed:',e);process.exit(1)});
+module.exports={rooms,tick,wss,srv,BD,cache,store,flushProfiles};
