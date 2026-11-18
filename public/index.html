@@ -1,272 +1,322 @@
-// imoveryou.io server (alpha): floors = rooms, server-side bots, bow draw-back, curve shots, walls, points + skins.
-// Run: npm install && npm start.  Test panel: open the game with ?dev=YOUR_KEY (set DEV_KEY env var on Render).
-const http=require('http'),fs=require('fs'),path=require('path'),crypto=require('crypto');
-const {WebSocketServer}=require('ws');
-const A=2400,TICK=30,DT=1/TICK,PORT=process.env.PORT||3000,DEV_KEY=process.env.DEV_KEY||'devtest';
-const PTS={kill:20,bot:5,floor:30};                       // points earned per player kill / bot kill / floor climbed
-// Per-player test settings (changed from the test panel, affect only that player).
-const DEF={speed:290,maxCharge:.4,minSpd:400,maxSpd:1400,rec:.25,arrowLife:.9,arrowDmg:34,bounceK:1,dashCd:1.6,dashSpd:1500,dashTime:.14,curveWin:1,curveK:1,need:3,lives:5,god:false,selfHit:true};
-const LIM={speed:[100,900],maxCharge:[.1,5],minSpd:[100,2000],maxSpd:[200,3000],rec:[0,2],arrowLife:[.2,3],arrowDmg:[1,200],bounceK:[0,1.2],dashCd:[0,5],dashSpd:[300,4000],dashTime:[.05,.6],curveWin:[0,3],curveK:[0,3],need:[1,20],lives:[1,20]};
-// Bot difficulty (server-wide). aimErr = aim error in radians, reload = seconds between shots, dmg = damage multiplier.
-const PRESETS={easy:{aimErr:.8,speed:90,reload:1.8,sight:450,dash:.1,dmg:.5,floorScale:.3},normal:{aimErr:.6,speed:115,reload:1.1,sight:550,dash:.3,dmg:.75,floorScale:.5},hard:{aimErr:.34,speed:150,reload:.4,sight:650,dash:.6,dmg:1,floorScale:1}};
-const BLIM={aimErr:[0,1.5],speed:[40,300],reload:[.25,4],sight:[200,900],dash:[0,1],dmg:[.1,1.5],floorScale:[0,2]};
-const BD={...PRESETS.normal};
-// ---- static files ----
-const PUB=path.join(__dirname,'public'),MIME={'.html':'text/html; charset=utf-8','.json':'application/json','.js':'text/javascript','.webmanifest':'application/manifest+json','.png':'image/png','.jpg':'image/jpeg','.webp':'image/webp','.svg':'image/svg+xml'};
-const srv=http.createServer((q,r)=>{
-  let u;try{u=decodeURIComponent((q.url||'/').split('?')[0])}catch{r.writeHead(400);return r.end()}
-  if(u==='/')u='/index.html';
-  const f=path.normalize(path.join(PUB,u));
-  if(!f.startsWith(PUB+path.sep)||!MIME[path.extname(f)]){r.writeHead(404);return r.end()}
-  fs.readFile(f,(e,d)=>{r.writeHead(e?404:200,{'Content-Type':MIME[path.extname(f)],'Cache-Control':'no-cache'});r.end(e?undefined:d)});
-});
-const wss=new WebSocketServer({server:srv});
-// ---- skins ----
-let SK=new Map([['classic',{price:0}]]);
-try{for(const s of JSON.parse(fs.readFileSync(path.join(PUB,'skins.json'))).skins)SK.set(String(s.id),{price:Math.max(0,+s.price||0)})}catch{}
-// ---- storage: Postgres when DATABASE_URL is set (accounts survive restarts); otherwise a JSON file for local testing only ----
-const sha=x=>crypto.createHash('sha256').update(x).digest('hex');
-const DEFPROF=()=>({points:0,owned:['classic'],skin:'classic'});
-let store;
-if(process.env.DATABASE_URL){
-  const {Pool}=require('pg');
-  const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_SSL==='off'?false:{rejectUnauthorized:false},max:5});
-  store={
-    async init(){await pool.query(`create table if not exists accounts(id serial primary key,email text unique not null,name text not null,hash text not null,created timestamptz default now());
-      create table if not exists sessions(hash text primary key,account_id int not null references accounts(id) on delete cascade,created timestamptz default now());
-      create table if not exists profiles(owner text primary key,points int not null default 0,owned jsonb not null default '["classic"]',skin text not null default 'classic',updated timestamptz default now())`)},
-    async account(email){return (await pool.query('select id,email,name,hash from accounts where email=$1',[email])).rows[0]||null},
-    async createAccount(email,name,hash){return (await pool.query('insert into accounts(email,name,hash) values($1,$2,$3) returning id',[email,name,hash])).rows[0].id},   // duplicate email throws code 23505
-    async session(tok){return (await pool.query("select a.id,a.email,a.name from sessions s join accounts a on a.id=s.account_id where s.hash=$1 and s.created>now()-interval '90 days'",[sha(tok)])).rows[0]||null},
-    async newSession(id,tok){await pool.query('insert into sessions(hash,account_id) values($1,$2)',[sha(tok),id])},
-    async delSession(tok){await pool.query('delete from sessions where hash=$1',[sha(tok)])},
-    async deleteAccount(id){await pool.query('delete from profiles where owner=$1',['a:'+id]);await pool.query('delete from accounts where id=$1',[id])},
-    async loadProfile(o){const r=(await pool.query('select points,owned,skin from profiles where owner=$1',[o])).rows[0];return r?{points:r.points,owned:r.owned,skin:r.skin}:null},
-    async saveProfiles(l){for(const [o,p] of l)await pool.query('insert into profiles(owner,points,owned,skin) values($1,$2,$3,$4) on conflict(owner) do update set points=$2,owned=$3,skin=$4,updated=now()',[o,p.points,JSON.stringify(p.owned),p.skin])},
-  };
-}else{
-  const F=path.join(process.env.DATA_DIR||__dirname,'data.json');let D={accounts:[],sessions:{},profiles:{}};
-  try{const raw=JSON.parse(fs.readFileSync(F));if(raw.accounts)D={...D,...raw};else for(const k in raw)D.profiles['g:'+k]=raw[k]}catch{}
-  const flush=()=>{try{fs.writeFileSync(F,JSON.stringify(D))}catch{}};
-  store={
-    async init(){console.log('No DATABASE_URL set: using data.json (on Render free this resets on redeploy)')},
-    async account(e){return D.accounts.find(a=>a.email===e)||null},
-    async createAccount(e,n,h){if(D.accounts.some(a=>a.email===e)){const x=new Error('dup');x.code='23505';throw x}const id=D.accounts.reduce((m,a)=>Math.max(m,a.id),0)+1;D.accounts.push({id,email:e,name:n,hash:h});flush();return id},
-    async session(t){const id=D.sessions[sha(t)],a=id&&D.accounts.find(a=>a.id===id);return a?{id:a.id,email:a.email,name:a.name}:null},
-    async newSession(id,t){D.sessions[sha(t)]=id;flush()},
-    async delSession(t){delete D.sessions[sha(t)];flush()},
-    async deleteAccount(id){D.accounts=D.accounts.filter(a=>a.id!==id);for(const k in D.sessions)if(D.sessions[k]===id)delete D.sessions[k];delete D.profiles['a:'+id];flush()},
-    async loadProfile(o){return D.profiles[o]?JSON.parse(JSON.stringify(D.profiles[o])):null},
-    async saveProfiles(l){for(const [o,p] of l)D.profiles[o]=JSON.parse(JSON.stringify(p));flush()},
-  };
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>imoveryou.io</title>
+<link rel="manifest" href="manifest.json"><meta name="theme-color" content="#0f1a19">
+<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><link rel="apple-touch-icon" href="icon-192.png">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0f1a19;--fg:#f3efe2;--hot:#ff5a3c;--dim:#9db3ad;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html,body{height:100%;margin:0;touch-action:none;-webkit-touch-callout:none;background:var(--bg);color:var(--fg);font-family:"Bricolage Grotesque",system-ui,sans-serif;overflow:hidden;cursor:crosshair;user-select:none}
+canvas#c{position:fixed;inset:0;display:block}
+.hud{position:fixed;left:16px;top:calc(12px + env(safe-area-inset-top,0px));pointer-events:none}
+.floor{font-weight:800;font-size:34px;line-height:1}
+.pips{display:flex;gap:6px;margin-top:8px}
+.pips i{width:22px;height:8px;border-radius:2px;background:rgba(243,239,226,.2)}
+.pips i.on{background:var(--hot)}
+.sub{margin-top:6px;font-size:13px;color:var(--dim)}
+.lb{position:fixed;right:14px;top:calc(12px + env(safe-area-inset-top,0px));min-width:170px;font-size:13px;background:rgba(15,26,25,.55);border-radius:8px;padding:8px 12px;pointer-events:none}
+.lb b{display:block;margin-bottom:4px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
+.lb div{display:flex;justify-content:space-between;gap:12px;padding:1px 0}
+.lb .me{color:var(--hot);font-weight:800}
+.dash{position:fixed;left:50%;bottom:calc(22px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);width:200px;pointer-events:none;text-align:center;font-size:13px;color:var(--dim)}
+.bar{height:6px;border-radius:3px;background:rgba(243,239,226,.18);margin-top:6px;overflow:hidden}
+.bar b{display:block;height:100%;width:100%;background:var(--fg)}
+.banner{position:fixed;left:0;right:0;top:30%;text-align:center;font-weight:800;font-size:clamp(40px,9vw,96px);pointer-events:none;opacity:0}
+.banner.go{animation:b 1.6s ease-out}
+@keyframes b{0%{opacity:0;transform:scale(.8)}15%{opacity:1;transform:scale(1)}70%{opacity:1}100%{opacity:0}}
+.menu,.shop{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(15,26,25,.86);text-align:center;padding:24px;cursor:default}
+.shop{z-index:8;justify-content:flex-start;overflow:auto;background:rgba(15,26,25,.96)}
+.menu h1{font-size:clamp(44px,9vw,88px);margin:0;font-weight:800;letter-spacing:-.03em}
+.menu h1 span{color:var(--hot)}
+.menu p{margin:0;max-width:40ch;color:var(--dim);line-height:1.45}
+.row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}
+button{font:inherit;font-weight:800;font-size:20px;padding:12px 34px;border:0;border-radius:8px;background:var(--hot);color:#1a0b07;cursor:pointer}
+button.alt{background:rgba(243,239,226,.16);color:var(--fg)}
+button:disabled{opacity:.45;cursor:default}
+button:focus-visible,input:focus-visible{outline:3px solid var(--fg);outline-offset:3px}
+#nm{font:inherit;font-size:18px;padding:10px 14px;border-radius:8px;border:0;text-align:center}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;width:min(900px,100%)}
+.card{background:rgba(243,239,226,.08);border-radius:10px;padding:12px;display:flex;flex-direction:column;align-items:center;gap:6px}
+.card button{font-size:14px;padding:7px 14px;width:100%}
+.card small{color:var(--dim)}
+.hide{display:none!important}
+.fld{font:inherit;font-size:16px;padding:10px 14px;border-radius:8px;border:0;width:100%;box-sizing:border-box}
+.devbtn{position:fixed;right:12px;bottom:calc(12px + env(safe-area-inset-bottom,0px));font-size:13px;padding:6px 12px;background:rgba(243,239,226,.15);color:var(--fg);z-index:5}
+.dev{position:fixed;left:12px;top:calc(130px + env(safe-area-inset-top,0px));width:290px;max-width:calc(100vw - 24px);max-height:calc(100% - 200px);overflow:auto;background:rgba(15,26,25,.94);border:1px solid rgba(243,239,226,.25);border-radius:10px;padding:12px 14px;font-size:13px;z-index:6;cursor:default}
+.dev h2{margin:0 0 4px;font-size:16px}.dev h3{margin:14px 0 2px;font-size:13px;color:var(--hot);text-transform:uppercase;letter-spacing:.06em}
+.dev label{display:block;margin:8px 0 2px;color:var(--dim)}.dev label span{float:right;color:var(--fg)}
+.dev input[type=range]{width:100%}
+.dev input[type=number]{width:64px;font:inherit;padding:4px;border-radius:4px;border:1px solid var(--dim);background:var(--bg);color:var(--fg)}
+.dev button{font-size:13px;padding:6px 12px;margin:8px 6px 0 0}.dev small{display:block;margin-top:10px;color:var(--dim)}
+.stick{position:fixed;width:120px;height:120px;border-radius:50%;border:2px solid rgba(243,239,226,.45);background:rgba(243,239,226,.08);pointer-events:none;z-index:4}
+.stick i{position:absolute;left:50%;top:50%;width:52px;height:52px;margin:-26px;border-radius:50%;background:rgba(243,239,226,.5)}
+.dashbtn{position:fixed;right:22px;bottom:calc(130px + env(safe-area-inset-bottom,0px));width:88px;height:88px;border-radius:50%;padding:0;font-size:16px;z-index:4;touch-action:none}
+.thint{position:fixed;left:0;right:0;bottom:calc(60px + env(safe-area-inset-bottom,0px));display:flex;justify-content:space-between;padding:0 24px;font-size:12px;color:var(--dim);pointer-events:none;opacity:.8}
+.card p{margin:0;font-size:14px;line-height:1.45;color:var(--dim);text-align:left}
+.card b{font-size:16px}
+@media (prefers-reduced-motion:reduce){.banner.go{animation:none}}
+</style></head><body>
+<canvas id="c"></canvas>
+<div class="hud"><div class="floor" id="fl">Floor 1</div><div class="pips" id="pips"></div><div class="sub" id="lv"></div><div class="sub" id="pt"></div></div>
+<div class="lb" id="lb"></div>
+<div class="dash"><div class="bar" style="margin:0 0 8px"><b id="pb" style="background:var(--hot);width:0"></b></div><span id="dt">Dash ready · Space</span><div class="bar"><b id="db"></b></div></div>
+<div class="stick hide" id="stL"><i></i></div><div class="stick hide" id="stR"><i></i></div>
+<button class="dashbtn hide" id="dashbtn">DASH</button>
+<div class="thint hide" id="thint"><span>MOVE</span><span>AIM: hold to draw, release to fire</span></div>
+<div class="shop hide" id="howto"><h1 style="margin:0">How to play</h1><div class="grid" id="howgrid" style="grid-template-columns:repeat(auto-fill,minmax(260px,1fr))"></div><button class="alt" id="howx">Back</button></div>
+<div class="shop hide" id="settings"><h1 style="margin:0">Settings</h1><button class="alt" id="joybtn"></button>
+  <p class="sub" style="max-width:44ch;font-size:14px;line-height:1.5">Joystick on: touch the left half of the screen to move, touch the right half to aim (hold to draw the bow, let go to fire), and use the DASH button. Off: touch and drag to steer toward your finger, hold to draw.</p>
+  <button class="alt" id="setx">Back</button></div>
+<div class="shop hide" id="acct"><h1 style="margin:0">Account</h1>
+  <p class="sub" style="max-width:44ch;font-size:14px;line-height:1.5">An account keeps your points and skins safe and lets you play on any device. Your guest points and skins move into a new account when you create it.</p>
+  <div id="aout" style="display:flex;flex-direction:column;gap:10px;align-items:center;width:min(320px,100%)">
+    <input class="fld" id="aemail" type="email" autocomplete="email" placeholder="Email">
+    <input class="fld" id="apass" type="password" autocomplete="current-password" placeholder="Password (8+ characters)">
+    <input class="fld" id="aname" maxlength="12" placeholder="Display name (new accounts)">
+    <div class="row"><button id="alogin">Sign in</button><button class="alt" id="areg">Create account</button></div></div>
+  <div id="ain" class="hide" style="display:flex;flex-direction:column;gap:10px;align-items:center"><b id="awho"></b><button class="alt" id="aoutbtn">Sign out</button>
+    <input class="fld" id="apass2" type="password" placeholder="Password (to delete)"><button class="alt" id="adel">Delete account</button></div>
+  <div class="sub" id="aerr" style="color:var(--hot);min-height:1.2em"></div><button class="alt" id="acctx">Back</button></div>
+<div class="banner" id="bn"></div>
+<button class="devbtn hide" id="devbtn">Test panel</button>
+<div class="dev hide" id="dev"><h2>Test panel</h2></div>
+<div class="menu" id="menu">
+  <h1>imoveryou<span>.io</span></h1>
+  <p id="mt"></p>
+  <input id="nm" maxlength="12" placeholder="Your name">
+  <div class="row"><button id="play">Play</button><button class="alt" id="shopbtn">Skins shop</button></div>
+  <div class="row"><button class="alt" id="howbtn">How to play</button><button class="alt" id="setbtn">Settings</button><button class="alt" id="acctbtn">Account</button></div>
+  <div class="sub" id="mpts"></div>
+</div>
+<div class="shop hide" id="shop">
+  <h1 style="margin:0">Skins shop</h1><div class="sub" id="spts" style="font-size:18px"></div>
+  <div class="grid" id="skins"></div><button class="alt" id="shopx">Back</button>
+</div>
+<script src="config.js"></script>
+<script>
+const cv=document.getElementById('c'),g=cv.getContext('2d'),$=id=>document.getElementById(id);
+let W,H;function rs(){W=cv.width=innerWidth;H=cv.height=innerHeight}addEventListener('resize',rs);rs();
+const A=2400,R=(a,b)=>a+Math.random()*(b-a);
+let ws,authed=false,want=false,prof={points:0,owned:['classic'],skin:'classic'},acct=null,my=0,floor=0,kills=-1,need=3,lives=5,pts=0,dcd=0,dm=1.6,cw=0;
+let E=new Map(),AR=[],WL=[],arT=0,fx=[],shake=0,down=false,mouse={x:0,y:0},last=0,bt,lbKey='',SK={classic:{id:'classic',name:'Classic',price:0,style:{}}},SKL=[SK.classic];
+const ls=(k,v)=>{try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v)}catch{}};
+let tok=ls('iov_token');if(!tok){tok=(crypto.randomUUID?crypto.randomUUID():Date.now()+Math.random().toString(36).slice(2)+'0123456789abcdef');ls('iov_token',tok)}
+$('nm').value=ls('iov_name')||'';
+
+// ---------- art hooks: any file below that exists in /assets is used instead of the sketch placeholder ----------
+const IM={},PT={};
+function img(p){let o=IM[p];if(!o){o=IM[p]={i:new Image(),ok:false};o.i.onload=()=>o.ok=true;o.i.src=p}return o.ok?o.i:null}
+function pat(im,s){const k=im.src+s;if(!PT[k]){const p=g.createPattern(im,'repeat');p.setTransform(new DOMMatrix([s,0,0,s,0,0]));PT[k]=p}return PT[k]}
+function spr(c,im,x,y,ang,w,h){c.save();c.translate(x,y);c.rotate(ang);c.drawImage(im,-w/2,-h/2,w,h);c.restore()}
+function drawBody(c,x,y,rad,a,id,hue){          // skin sprite: assets/skins/<id>.png (256px, faces right, body circle = 56% of width)
+  const im=img('assets/skins/'+id+'.png');if(im){spr(c,im,x,y,a,rad*3.56,rad*3.56);return}
+  const st=(SK[id]&&SK[id].style)||{};c.save();c.globalAlpha*=st.alpha||1;
+  c.fillStyle=st.fill||`hsl(${hue} 75% 55%)`;c.beginPath();c.arc(x,y,rad,0,6.28);c.fill();
+  if(st.ring){c.strokeStyle=st.ring;c.lineWidth=rad*.3;c.beginPath();c.arc(x,y,rad*.55,0,6.28);c.stroke()}
+  if(st.stripe){c.strokeStyle=st.stripe;c.lineWidth=rad*.35;c.beginPath();c.moveTo(x-rad*.7,y-rad*.7);c.lineTo(x+rad*.7,y+rad*.7);c.stroke()}
+  c.restore();
 }
-// Profiles are cached in memory while a player is connected and written back every 10 s (and on leave / shutdown).
-const cache=new Map(),dirtyP=new Set();
-async function getProfile(o){let p=cache.get(o);if(!p){p=(await store.loadProfile(o))||DEFPROF();cache.set(o,p)}return p}
-async function flushProfiles(){if(!dirtyP.size)return;const l=[...dirtyP].filter(o=>cache.has(o)).map(o=>[o,cache.get(o)]);dirtyP.clear();try{await store.saveProfiles(l)}catch(e){console.error('save failed:',e.message);for(const [o] of l)dirtyP.add(o)}}
-setInterval(flushProfiles,10000);process.on('SIGTERM',async()=>{await flushProfiles();process.exit(0)});
-async function release(o,ws){if(!o||[...(wss.clients||[])].some(c=>c!==ws&&c.p&&c.p.owner===o))return;await flushProfiles();cache.delete(o)}
-const prof=p=>cache.get(p.owner);
-const give=(p,n)=>{if(!p.bot&&p.owner&&cache.has(p.owner)){prof(p).points+=n;dirtyP.add(p.owner)}};
-const sendProf=p=>{const x=prof(p);p.ws.send(JSON.stringify({t:'prof',points:x.points,owned:x.owned,skin:x.skin,dev:p.dev,acct:p.acct?{name:p.acct.name,email:p.acct.email}:null}))};
-// ---- passwords (scrypt) + login rate limit ----
-const scrypt=(pw,salt)=>new Promise((res,rej)=>crypto.scrypt(pw,salt,64,(e,k)=>e?rej(e):res(k)));
-const hashPw=async pw=>{const s=crypto.randomBytes(16);return s.toString('hex')+'$'+(await scrypt(pw,s)).toString('hex')};
-const checkPw=async(pw,h)=>{const [s,k]=String(h).split('$'),d=await scrypt(pw,Buffer.from(s,'hex')),e=Buffer.from(k,'hex');return d.length===e.length&&crypto.timingSafeEqual(d,e)};
-const RL=new Map();
-const limited=(ip,max=20,win=600000)=>{const n=Date.now();let r=RL.get(ip);if(!r||n-r.t>win){r={t:n,c:0};RL.set(ip,r)}return ++r.c>max};
-setInterval(()=>{const n=Date.now();for(const [k,r] of RL)if(n-r.t>600000)RL.delete(k)},60000);
-// ---- game ----
-const rooms=new Map();let nid=1,lb=[],lbT=0;
-const R=(a,b)=>a+Math.random()*(b-a);
-const num=(v,d=0,max=1e4)=>Number.isFinite(+v)?Math.max(-max,Math.min(max,+v)):d;
-const cl=(v,[lo,hi],d)=>Math.max(lo,Math.min(hi,num(v,d,1e6)));
-function wallsFor(f){   // none on floor 1; pinwheel of bars from floor 2; corner pillars from floor 3
-  if(f<2)return[];
-  const w=[{x:1000,y:1000,w:300,h:40},{x:1360,y:1000,w:40,h:300},{x:1100,y:1360,w:300,h:40},{x:1000,y:1100,w:40,h:300}];
-  if(f>=3)for(const [x,y] of [[560,560],[1760,560],[560,1760],[1760,1760]])w.push({x,y,w:80,h:80});
-  return w;
-}
-const hitWall=(w,x,y,m=2)=>w.some(q=>x>=q.x-m&&x<=q.x+q.w+m&&y>=q.y-m&&y<=q.y+q.h+m);
-const room=f=>{let r=rooms.get(f);if(!r){r={f,ps:new Map(),ar:[],ev:[],bo:undefined,w:wallsFor(f)};rooms.set(f,r)}return r};
-const mkEnt=o=>Object.assign({a:0,ma:0,d:0,fire:false,dcd:0,dash:0,charge:0,charging:false,rec:0,hp:100,kills:0,tk:0,vx:0,vy:0,spd:290,c:{...DEF},floor:0,bot:false,av:0,pa:0,cwl:0,deaths:0,best:1,gi:0,skin:'classic',token:null,owner:null,acct:null,session:null},o);
-function spawnPos(r){for(let i=0;i<60;i++){const x=R(150,A-150),y=R(150,A-150);if(!hitWall(r.w,x,y,50))return[x,y]}return[150,150]}
-function pushOut(p,w){
-  for(const q of w){
-    const cx=Math.max(q.x,Math.min(p.x,q.x+q.w)),cy=Math.max(q.y,Math.min(p.y,q.y+q.h)),dx=p.x-cx,dy=p.y-cy,d=Math.hypot(dx,dy);
-    if(d>=18)continue;
-    if(d>0){p.x+=dx/d*(18-d);p.y+=dy/d*(18-d)}
-    else{const l=p.x-q.x,rr=q.x+q.w-p.x,t=p.y-q.y,b=q.y+q.h-p.y,m=Math.min(l,rr,t,b);
-      if(m===l)p.x=q.x-18;else if(m===rr)p.x=q.x+q.w+18;else if(m===t)p.y=q.y-18;else p.y=q.y+q.h+18}
+
+// ---------- HUD / menus ----------
+const pips=$('pips');
+function setPips(){pips.textContent='';for(let i=0;i<need;i++)pips.appendChild(document.createElement('i'))}
+function hud(){$('fl').textContent='Floor '+floor;$('lv').textContent='Lives: '+lives;$('pt').textContent='Points: '+pts;[...pips.children].forEach((p,i)=>p.classList.toggle('on',i<kills))}
+function banner(t){const b=$('bn');clearTimeout(bt);b.textContent=t;b.classList.remove('go');void b.offsetWidth;b.classList.add('go');bt=setTimeout(()=>b.classList.remove('go'),1600)}
+function burst(x,y,h,n){for(let i=0;i<n;i++){const a=R(0,6.28),s=R(80,380);fx.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,l:R(.3,.7),h})}}
+function menuText(t){$('mt').textContent=t}
+const who=()=>'Points: '+prof.points+' · '+(acct?'Signed in as '+acct.name:'Guest (create an account to keep your progress)');
+function showMenu(){$('menu').classList.remove('hide');$('mpts').textContent=who()}
+menuText('Hold click to draw your bow and release to fire. Space to dash. New here? Tap How to play.');
+fetch('skins.json').then(r=>r.json()).then(j=>{SKL=j.skins;SK=Object.fromEntries(SKL.map(s=>[s.id,s]));renderShop()}).catch(()=>{});
+function renderShop(){
+  $('spts').textContent='Your points: '+prof.points;$('mpts').textContent=who();
+  const box=$('skins');box.textContent='';
+  for(const s of SKL){
+    const owned=prof.owned.includes(s.id),eq=prof.skin===s.id,c=document.createElement('div');c.className='card';
+    const cn=document.createElement('canvas');cn.width=cn.height=88;drawBody(cn.getContext('2d'),44,44,24,0,s.id,18);
+    const nm=document.createElement('b');nm.textContent=s.name;
+    const bt2=document.createElement('button');
+    if(eq){bt2.textContent='Equipped';bt2.disabled=true}
+    else if(owned){bt2.textContent='Equip';bt2.onclick=()=>send({t:'equip',id:s.id})}
+    else{bt2.textContent='Buy · '+s.price;bt2.disabled=prof.points<s.price;bt2.onclick=()=>send({t:'buy',id:s.id})}
+    c.append(cn,nm,bt2);box.appendChild(c);
   }
 }
-function move(p,w){const dx=p.vx*DT,dy=p.vy*DT,n=Math.max(1,Math.ceil(Math.hypot(dx,dy)/10));
-  for(let i=0;i<n;i++){p.x=Math.max(18,Math.min(A-18,p.x+dx/n));p.y=Math.max(18,Math.min(A-18,p.y+dy/n));pushOut(p,w)}}
-function place(p,f){
-  if(p.floor)rooms.get(p.floor)?.ps.delete(p.id);
-  const r=room(f),[sx,sy]=spawnPos(r);
-  Object.assign(p,{floor:f,x:sx,y:sy,vx:0,vy:0,hp:100,dash:0,kills:0,charge:0,charging:false,rec:0});
-  p.best=Math.max(p.best,f);r.ps.set(p.id,p);
+$('shopbtn').onclick=()=>{renderShop();$('shop').classList.remove('hide')};
+$('shopx').onclick=()=>$('shop').classList.add('hide');
+
+// ---------- networking ----------
+const send=o=>ws&&ws.readyState===1&&ws.send(JSON.stringify(o));
+function connect(){
+  ws=new WebSocket(window.IOV_SERVER?'wss://'+window.IOV_SERVER:(location.protocol==='https:'?'wss://':'ws://')+location.host);   // IOV_SERVER (config.js) is only needed for the mobile app
+  ws.onopen=()=>send({t:'auth',token:tok,session:ls('iov_session')||'',key:new URLSearchParams(location.search).get('dev')||''});
+  ws.onmessage=m=>{const s=JSON.parse(m.data);s.t==='prof'?onProf(s):s.t==='acct'?onAcct(s):s.t==='bd'?onBd(s.v):s.t==='over'?over(s):snap(s)};
+  ws.onclose=()=>{authed=false;my=0;menuText('Disconnected from the server. Press Play to reconnect.');showMenu()};
 }
-function spawnBot(r){const [sx,sy]=spawnPos(r);const b=mkEnt({id:nid++,name:'Bot',skin:'bot',hue:Math.round(R(0,360)),bot:true,floor:r.f,x:sx,y:sy,wt:0,want:1,err:0});r.ps.set(b.id,b)}
-function doDash(p){if(p.dcd>0)return;p.dash=p.c.dashTime;p.dcd=p.c.dashCd;p.cwl=p.c.curveWin;p.vx=Math.cos(p.ma)*p.c.dashSpd;p.vy=Math.sin(p.ma)*p.c.dashSpd}
-function muzzle(p,r){const x=p.x+Math.cos(p.a)*18,y=p.y+Math.sin(p.a)*18;return hitWall(r.w,x,y)?[p.x,p.y]:[x,y]}
-function loose(p,r){
-  const c=p.c,lo=Math.min(c.minSpd,c.maxSpd),hi=Math.max(c.minSpd,c.maxSpd),s=lo+(hi-lo)*Math.min(1,p.charge/c.maxCharge);
-  // curve shot: dash, then flick your aim and release inside the window; turn rate follows how fast the aim was swung
-  let w=0;if(!p.bot&&p.cwl>0&&Math.abs(p.av)>2){w=Math.max(-2.2,Math.min(2.2,p.av*.12*c.curveK));p.cwl=0}
-  const m=muzzle(p,r);
-  r.ar.push({x:m[0],y:m[1],vx:Math.cos(p.a)*s,vy:Math.sin(p.a)*s,l:c.arrowLife,o:p.id,w,d:c.arrowDmg*(p.bot?BD.dmg:1),k:c.bounceK,sh:c.selfHit,b:0});
+function startGame(){
+  ls('iov_name',$('nm').value);
+  if(authed)join();else{want=true;if(!ws||ws.readyState>1)connect()}
 }
-function wallStep(a,r,h){   // billiard bounce: flip the velocity component that hit the wall
-  if(a.w){const c=Math.cos(a.w*h),s=Math.sin(a.w*h),x=a.vx;a.vx=x*c-a.vy*s;a.vy=x*s+a.vy*c}
-  const px=a.x,py=a.y;let nx=px+a.vx*h,ny=py+a.vy*h;
-  const bx=hitWall(r.w,nx,py),by=hitWall(r.w,px,ny);let bounced=false;
-  if(bx||by){if(bx){a.vx=-a.vx;nx=px}if(by){a.vy=-a.vy;ny=py}bounced=true}
-  else if(hitWall(r.w,nx,ny)){a.vx=-a.vx;a.vy=-a.vy;nx=px;ny=py;bounced=true}
-  if(bounced){a.b++;a.vx*=a.k;a.vy*=a.k;r.ev.push([Math.round(px),Math.round(py),40,2])}
-  a.x=nx;a.y=ny;a.l-=h;
+function join(){send({t:'join',name:$('nm').value||'player'});$('menu').classList.add('hide');$('shop').classList.add('hide')}
+function onProf(s){prof=s;acct=s.acct;authed=true;if(!acct&&ls('iov_session'))ls('iov_session','');if(acct&&!$('nm').value)$('nm').value=acct.name;renderAcct();renderShop();if(s.dev)buildDev();if(want){want=false;join()}}
+function over(s){
+  my=0;floor=0;kills=-1;E.clear();AR=[];WL=[];g.fillStyle='#0f1a19';g.fillRect(0,0,W,H);
+  menuText('Out of lives after '+s.lives+' knockouts. Best floor: '+s.best+' · Kills: '+s.tk+'. Spend your points in the shop, then play again.');
+  $('play').textContent='Play again';showMenu();
 }
-function botAI(b,r){
-  let t=null,bd=BD.sight;
-  for(const o of r.ps.values()){if(o===b)continue;const d=Math.hypot(o.x-b.x,o.y-b.y);if(d<bd){bd=d;t=o}}
-  b.spd=BD.speed+r.f*8*BD.floorScale;
-  if(t){
-    const ta=Math.atan2(t.y-b.y,t.x-b.x),acc=Math.max(.04,BD.aimErr-r.f*.04*BD.floorScale);
-    if(!b.charging)b.err=R(-acc,acc);
-    b.a=ta+b.err;
-    const dir=bd>280?1:-.3,side=Math.sin(Date.now()/700+b.hue)*.8;
-    b.ma=Math.atan2(Math.sin(ta)*dir+Math.cos(ta)*side,Math.cos(ta)*dir-Math.sin(ta)*side);b.d=90;
-    if(b.fire&&b.charge>=b.want)b.fire=false;
-    else if(!b.fire&&!b.charging&&b.rec<=0){b.fire=true;b.want=R(.3,1)*b.c.maxCharge}
-    if(b.hp<50&&Math.random()<DT*BD.dash)doDash(b);
-  }else{b.fire=false;b.wt-=DT;if(b.wt<=0){b.wt=R(1,3);b.ma=R(0,6.28);b.a=b.ma}b.d=60}
+function snap(s){
+  my=s.id;
+  if(s.fl!==floor){if(floor)banner(s.fl>floor?'Floor '+s.fl:'Back to floor '+s.fl);floor=s.fl;E.clear()}
+  if(s.nd!==need||!pips.children.length){need=s.nd;setPips()}
+  kills=s.k;lives=s.lv;pts=s.pt;prof.points=s.pt;hud();dcd=s.dcd;dm=s.dm;cw=s.cw;
+  const k=JSON.stringify(s.lb);if(k!==lbKey){lbKey=k;const L=$('lb');L.textContent='';const t=document.createElement('b');t.textContent='Top players';L.appendChild(t);
+    for(const r of s.lb){const d=document.createElement('div');if(r[0]===my)d.className='me';const a=document.createElement('span'),b=document.createElement('span');a.textContent=r[1];b.textContent=r[2]+' kills · F'+r[3];d.append(a,b);L.appendChild(d)}}
+  const seen=new Set();
+  for(const q of s.p){seen.add(q[0]);let e=E.get(q[0]);if(!e){e={x:q[1],y:q[2]};E.set(q[0],e)}
+    Object.assign(e,{tx:q[1],ty:q[2],a:q[3],hp:q[4],hue:q[5],dash:q[6],name:q[7],ch:q[8],bot:q[9],skin:q[10]})}
+  for(const k2 of E.keys())if(!seen.has(k2))E.delete(k2);
+  AR=s.a;WL=s.w||[];arT=performance.now();
+  for(const v of s.e){burst(v[0],v[1],v[2],v[3]===1?26:v[3]===2?4:6);if(v[3]===1&&v[4]===my)shake=8}
 }
-wss.on('connection',(ws,req)=>{
-  const p=mkEnt({id:nid++,ws,name:'player',hue:Math.round(R(0,360)),dev:false});ws.p=p;
-  p.ip=((req&&req.headers['x-forwarded-for'])||'').split(',')[0].trim()||(req&&req.socket.remoteAddress)||'?';
-  const err=m=>ws.send(JSON.stringify({t:'acct',err:m}));
-  const bind=async(acct,session)=>{const old=p.owner;p.acct=acct;p.session=session;p.owner=acct?'a:'+acct.id:'g:'+p.token;await getProfile(p.owner);p.skin=prof(p).skin;return old};
-  ws.on('message',async m=>{
-    if(m.length>400)return;
-    let d;try{d=JSON.parse(m)}catch{return}
-    try{
-      if(d.t==='auth'){
-        const t=String(d.token||'');if(p.token||!/^[\w-]{16,64}$/.test(t))return;
-        p.token=t;p.dev=String(d.key||'')===DEV_KEY;
-        let a=null;if(/^[a-f0-9]{64}$/.test(String(d.session||'')))a=await store.session(d.session);
-        await bind(a&&{id:a.id,email:a.email,name:a.name},a?d.session:null);
-        sendProf(p);if(p.dev)ws.send(JSON.stringify({t:'bd',v:BD}));return;
-      }
-      if(!p.owner)return;
-      if(d.t==='register'||d.t==='login'){
-        if(p.floor||p.busy)return;
-        if(d.t==='register'&&p.acct)return err('Sign out first.');
-        p.busy=true;
-        try{
-          if(limited(p.ip))return err('Too many attempts. Please wait a few minutes.');
-          const email=String(d.email||'').trim().toLowerCase(),pw=String(d.pass||'');
-          let acct;
-          if(d.t==='register'){
-            if(email.length>254||!/^[^\s@]{1,64}@[^\s@]+\.[^\s@]{2,}$/.test(email))return err('Please enter a valid email address.');
-            if(pw.length<8||pw.length>128)return err('Password must be 8 to 128 characters.');
-            const name=(String(d.name||'').trim()||email.split('@')[0]).slice(0,12);
-            let id;try{id=await store.createAccount(email,name,await hashPw(pw))}catch(e){if(e.code==='23505')return err('That email already has an account. Try signing in.');throw e}
-            const g=await getProfile(p.owner),ap=await getProfile('a:'+id);          // guest progress moves into the new account
-            Object.assign(ap,{points:g.points,owned:[...g.owned],skin:g.skin});Object.assign(g,DEFPROF());dirtyP.add(p.owner);dirtyP.add('a:'+id);
-            acct={id,email,name};
-          }else{
-            const a=await store.account(email);if(!a||!(await checkPw(pw,a.hash)))return err('Wrong email or password.');
-            acct={id:a.id,email:a.email,name:a.name};
-          }
-          const session=crypto.randomBytes(32).toString('hex');await store.newSession(acct.id,session);
-          const old=await bind(acct,session);ws.send(JSON.stringify({t:'acct',ok:true,session,name:acct.name}));sendProf(p);release(old,ws);
-        }finally{p.busy=false}
-        return;
-      }
-      if(d.t==='logout'){
-        if(!p.acct||p.floor||p.busy)return;p.busy=true;
-        try{await store.delSession(p.session);const old=await bind(null,null);ws.send(JSON.stringify({t:'acct',ok:true,out:true}));sendProf(p);release(old,ws)}finally{p.busy=false}
-        return;
-      }
-      if(d.t==='delacct'){   // permanent: removes the account, its sessions, points and skins
-        if(!p.acct||p.floor||p.busy)return;p.busy=true;
-        try{
-          const a=await store.account(p.acct.email);
-          if(limited(p.ip)||!a||!(await checkPw(String(d.pass||''),a.hash)))return err('Wrong password.');
-          await store.deleteAccount(a.id);const old=p.owner;cache.delete(old);dirtyP.delete(old);
-          await bind(null,null);ws.send(JSON.stringify({t:'acct',ok:true,out:true}));sendProf(p);
-        }finally{p.busy=false}
-        return;
-      }
-      if(d.t==='join'){if(p.floor)return;p.name=String(d.name||p.acct?.name||'player').slice(0,12);p.skin=prof(p).skin;p.deaths=0;p.best=1;p.kills=0;p.tk=0;place(p,1);return}
-      if(d.t==='buy'){const s=SK.get(String(d.id)),x=prof(p);if(!s||x.owned.includes(String(d.id))||x.points<s.price)return;x.points-=s.price;x.owned.push(String(d.id));dirtyP.add(p.owner);sendProf(p);return}
-      if(d.t==='equip'){const x=prof(p),id=String(d.id);if(!x.owned.includes(id))return;x.skin=id;p.skin=id;dirtyP.add(p.owner);sendProf(p);return}
-      if(!p.floor)return;
-      if(d.t==='in'){const na=num(d.a,0,7);if(!p.gi){p.gi=1;p.pa=na}p.a=na;p.ma=d.m===undefined?na:num(d.m,0,7);p.d=Math.max(0,num(d.d,0));p.fire=!!d.f}
-      else if(d.t==='dash')doDash(p);
-      else if(!p.dev)return;
-      else if(d.t==='cfg'){if(d.k==='god'||d.k==='selfHit')p.c[d.k]=!!d.v;else if(LIM[d.k])p.c[d.k]=cl(d.v,LIM[d.k],DEF[d.k])}
-      else if(d.t==='floor')place(p,Math.max(1,Math.min(99,Math.round(num(d.v,1)))));
-      else if(d.t==='bots'){const n=Math.round(num(d.v,-1,100));room(p.floor).bo=n<0?undefined:Math.min(40,n)}
-      else if(d.t==='bd'||d.t==='bdpreset'){
-        if(d.t==='bd'&&Object.hasOwn(BLIM,d.k))BD[d.k]=cl(d.v,BLIM[d.k],BD[d.k]);
-        if(d.t==='bdpreset'&&Object.hasOwn(PRESETS,d.v))Object.assign(BD,PRESETS[d.v]);
-        for(const c of wss.clients||[])if(c.p?.dev&&c.readyState===1)c.send(JSON.stringify({t:'bd',v:BD}));
-      }
-    }catch(e){console.error('message error:',e.message);try{err('Something went wrong. Please try again.')}catch{}}
-  });
-  ws.on('close',()=>{rooms.get(p.floor)?.ps.delete(p.id);release(p.owner,ws)});
-});
-function tick(){
-  if(++lbT%10===0)lb=[...rooms.values()].flatMap(r=>[...r.ps.values()].filter(p=>!p.bot)).sort((a,b)=>b.tk-a.tk||b.floor-a.floor).slice(0,5).map(p=>[p.id,p.name,p.tk,p.floor]);
-  for(const r of [...rooms.values()]){
-    if(![...r.ps.values()].some(p=>!p.bot)){rooms.delete(r.f);continue}
-    const target=r.bo??Math.min(4+2*r.f,16),bots=[...r.ps.values()].filter(p=>p.bot);
-    for(let n=bots.length;n<target;n++)spawnBot(r);
-    for(let n=bots.length;n>target;n--)r.ps.delete(bots.pop().id);
-    for(const p of r.ps.values()){
-      if(p.bot)botAI(p,r);
-      if(!p.bot){let da=p.a-p.pa;da=Math.atan2(Math.sin(da),Math.cos(da))/DT;p.pa=p.a;p.av=Math.abs(da)>Math.abs(p.av)?da:p.av*Math.exp(-DT/.25);p.av=Math.max(-40,Math.min(40,p.av))}
-      p.cwl-=DT;
-      if(p.dash<=0){const s=(p.bot?p.spd:p.c.speed)*Math.min(1,p.d/90);p.vx=Math.cos(p.ma)*s;p.vy=Math.sin(p.ma)*s}
-      p.dash-=DT;p.dcd-=DT;p.rec-=DT;
-      move(p,r.w);
-      if(p.fire&&p.rec<=0){p.charging=true;p.charge=Math.min(p.c.maxCharge,p.charge+DT)}
-      else if(p.charging&&!p.fire){loose(p,r);p.charging=false;p.charge=0;p.rec=p.bot?BD.reload:p.c.rec}
-    }
-    for(const a of r.ar){
-     const n=Math.max(1,Math.ceil(Math.hypot(a.vx,a.vy)*DT/8)),h=DT/n;
-     for(let st=0;st<n&&a.l>0;st++){
-      const px=a.x,py=a.y;wallStep(a,r,h);
-      if(a.x<0||a.y<0||a.x>A||a.y>A){a.l=0;break}
-      for(const v of r.ps.values()){
-        if((v.id===a.o&&!(a.b&&a.sh))||v.dash>0||seg(v.x,v.y,px,py,a.x,a.y)>=22)continue;   // owner is only hittable by their own bounced arrow
-        a.l=0;r.ev.push([Math.round(a.x),Math.round(a.y),v.hue,0]);
-        if(v.c.god)break;
-        v.hp-=a.d;
-        if(v.hp<=0){
-          r.ev.push([Math.round(v.x),Math.round(v.y),v.hue,1,a.o]);
-          const k=r.ps.get(a.o),credit=k&&k!==v&&!k.bot;
-          if(credit){k.tk++;give(k,v.bot?PTS.bot:PTS.kill)}
-          if(v.bot)r.ps.delete(v.id);
-          else if(++v.deaths>=v.c.lives){r.ps.delete(v.id);v.floor=0;v.fire=false;if(v.ws.readyState===1)v.ws.send(JSON.stringify({t:'over',best:v.best,tk:v.tk,lives:v.c.lives}))}   // out of lives: home screen
-          else place(v,Math.max(1,r.f-1));                                                    // knocked out: drop a floor
-          if(credit&&++k.kills>=k.c.need){give(k,PTS.floor);place(k,r.f+1)}                    // climb
-        }
-        break;
-      }
-     }
-    }
-    r.ar=r.ar.filter(a=>a.l>0);
-    const P=[...r.ps.values()];
-    const pl=P.map(p=>[p.id,Math.round(p.x),Math.round(p.y),+p.a.toFixed(2),p.hp,p.hue,p.dash>0?1:0,p.name,p.charging?+(p.charge/p.c.maxCharge).toFixed(2):0,p.bot?1:0,p.skin]);
-    const wl=r.w.map(q=>[q.x,q.y,q.w,q.h]),ar=r.ar.map(a=>[Math.round(a.x),Math.round(a.y),Math.round(a.vx),Math.round(a.vy),a.o,a.w?1:0]);
-    for(const p of P)if(!p.bot&&p.ws.readyState===1)p.ws.send(JSON.stringify({t:'s',id:p.id,fl:r.f,k:p.kills,nd:p.c.need,lv:p.c.lives-p.deaths,pt:(prof(p)||{}).points||0,dcd:Math.max(0,+p.dcd.toFixed(2)),dm:p.c.dashCd,cw:+Math.max(0,p.cwl).toFixed(2),lb,w:wl,p:pl,a:ar,e:r.ev}));
-    r.ev=[];
+
+// ---------- drawing ----------
+function draw(dt){
+  const me=E.get(my);if(!me)return;
+  const k=1-Math.exp(-dt*20);for(const e of E.values()){e.x+=(e.tx-e.x)*k;e.y+=(e.ty-e.y)*k}
+  const hue=(floor*57+160)%360,fi=img('assets/floor_'+floor+'.png')||img('assets/floor.png');
+  g.fillStyle=`hsl(${hue} 38% 17%)`;g.fillRect(0,0,W,H);
+  g.save();g.translate(W/2-me.x+(shake?R(-shake,shake):0),H/2-me.y+(shake?R(-shake,shake):0));
+  g.fillStyle=fi?pat(fi,.5):`hsl(${hue} 34% 23%)`;g.fillRect(0,0,A,A);
+  if(!fi){g.strokeStyle=`hsl(${hue} 30% 30%)`;g.lineWidth=1;g.beginPath();
+    const x0=Math.max(0,Math.floor((me.x-W/2)/100)*100),x1=Math.min(A,me.x+W/2),y0=Math.max(0,Math.floor((me.y-H/2)/100)*100),y1=Math.min(A,me.y+H/2);
+    for(let x=x0;x<=x1;x+=100){g.moveTo(x,y0);g.lineTo(x,y1)}for(let y=y0;y<=y1;y+=100){g.moveTo(x0,y);g.lineTo(x1,y)}g.stroke()}
+  g.strokeStyle='#f3efe2';g.lineWidth=6;g.strokeRect(0,0,A,A);
+  const wi=img('assets/wall.png'),pi=img('assets/pillar.png')||wi;
+  for(const q of WL){const im=q[2]===80&&q[3]===80?pi:wi;
+    if(im){g.save();g.translate(q[0],q[1]);g.fillStyle=pat(im,.5);g.fillRect(0,0,q[2],q[3]);g.restore()}
+    else{g.fillStyle='rgba(0,0,0,.35)';g.fillRect(q[0]+4,q[1]+6,q[2],q[3]);g.fillStyle=`hsl(${hue} 22% 62%)`;g.fillRect(q[0],q[1],q[2],q[3]);g.strokeStyle='#f3efe2';g.lineWidth=3;g.strokeRect(q[0],q[1],q[2],q[3])}}
+  g.lineCap='round';
+  const da=(performance.now()-arT)/1000;
+  for(const a of AR){const x=a[0]+a[2]*da,y=a[1]+a[3]*da,im=img(a[5]?'assets/arrow_curve.png':'assets/arrow.png')||img('assets/arrow.png');
+    if(im)spr(g,im,x,y,Math.atan2(a[3],a[2]),40,16);
+    else{g.strokeStyle=a[5]?'#ff9a3c':a[4]===my?'#fff':'#ffd9a0';g.lineWidth=a[5]?5:3;g.beginPath();g.moveTo(x,y);g.lineTo(x-a[2]*.025,y-a[3]*.025);g.stroke()}}
+  for(const [id,e] of E){
+    g.globalAlpha=e.dash?.35:1;drawBody(g,e.x,e.y,18,e.a,e.skin||'classic',e.hue);g.globalAlpha=1;
+    if(id===my){g.strokeStyle='#fff';g.lineWidth=3;g.beginPath();g.arc(e.x,e.y,18,0,6.28);g.stroke()}
+    const bw=img('assets/bow_'+(e.ch>0?(e.ch<.5?1:2):0)+'.png');
+    if(bw)spr(g,bw,e.x,e.y,e.a,64,64);
+    else{g.strokeStyle='#f3efe2';g.lineWidth=3;g.beginPath();g.arc(e.x,e.y,26,e.a-.9,e.a+.9);g.stroke();
+      if(e.ch>0){const c=Math.cos(e.a),n=Math.sin(e.a),t0=6-10*e.ch,t1=40-14*e.ch;g.strokeStyle='#ffd9a0';g.lineWidth=3;g.beginPath();g.moveTo(e.x+c*t0,e.y+n*t0);g.lineTo(e.x+c*t1,e.y+n*t1);g.stroke();
+        g.strokeStyle='#ff5a3c';g.lineWidth=4;g.beginPath();g.arc(e.x,e.y,32,e.a-.9,e.a-.9+1.8*e.ch);g.stroke()}}
+    g.fillStyle='rgba(0,0,0,.35)';g.fillRect(e.x-20,e.y-34,40,5);g.fillStyle=e.hp>50?'#8be28b':'#ff7a5c';g.fillRect(e.x-20,e.y-34,40*Math.max(0,e.hp)/100,5);
+    g.fillStyle=e.bot?'#9db3ad':'#f3efe2';g.font='600 12px system-ui,sans-serif';g.textAlign='center';g.fillText(e.name,e.x,e.y-40);
+  }
+  for(const p of fx){g.globalAlpha=Math.max(0,p.l*2);g.fillStyle=`hsl(${p.h} 80% 62%)`;g.fillRect(p.x-2,p.y-2,4,4)}
+  g.globalAlpha=1;g.restore();
+}
+function loop(t){
+  const dt=Math.min(.05,(t-last)/1000||0);last=t;
+  for(const p of fx){p.x+=p.vx*dt;p.y+=p.vy*dt;p.l-=dt}fx=fx.filter(p=>p.l>0);shake=Math.max(0,shake-dt*30);
+  $('db').style.width=((dm>0?Math.max(0,1-dcd/dm):1)*100)+'%';{const m=E.get(my);$('pb').style.width=((m&&m.ch||0)*100)+'%'}
+  $('dt').textContent=cw>0?'Curve window: flick and fire!':dcd>0?'Dash recharging':'Dash ready · Space';
+  {const on=joy&&my>0;$('dashbtn').classList.toggle('hide',!on);$('dashbtn').style.opacity=dcd>0?.4:1;$('thint').classList.toggle('hide',!on||touched);
+   if(!my){$('stL').classList.add('hide');$('stR').classList.add('hide');tl=ta=null;aiming=false;moveM=0}}
+  draw(dt);requestAnimationFrame(loop);
+}
+setInterval(()=>{if(!my)return;
+  if(joy){const now=performance.now();if(aiming)faceA=aimA;else if(now>aimLock&&moveM>0)faceA=moveA;
+    send({t:'in',a:faceA,d:moveM*90,m:moveA,f:aiming||now<fireUntil});return}
+  const dx=mouse.x-W/2,dy=mouse.y-H/2;send({t:'in',a:Math.atan2(dy,dx),d:Math.hypot(dx,dy),f:down})},33);
+addEventListener('pointermove',e=>{mouse.x=e.clientX;mouse.y=e.clientY;if(joy)joyMove(e)});
+addEventListener('pointerdown',e=>{if(e.target.closest(UI))return;if(joy){joyDown(e);return}mouse.x=e.clientX;mouse.y=e.clientY;down=true});
+addEventListener('pointerup',e=>{down=false;joyUp(e)});addEventListener('pointercancel',joyUp);
+addEventListener('keydown',e=>{
+  if(e.code==='Backquote'&&!$('devbtn').classList.contains('hide')){e.preventDefault();$('dev').classList.toggle('hide');return}
+  if(e.target.tagName==='INPUT'){if(e.key==='Enter'&&e.target.id==='nm')startGame();return}
+  if(e.code==='Space'){e.preventDefault();if(my)send({t:'dash'})}});
+
+// ---------- test panel (only with ?dev=KEY) ----------
+// [key,label,min,max,step,default]  - these apply to YOU only
+const PCFG=[['maxCharge','Max draw time (s)',.1,5,.1,.4],['rec','Recovery after a shot (s)',0,2,.05,.25],['minSpd','Slowest arrow (px/s)',100,2000,50,400],['maxSpd','Fastest arrow (px/s)',200,3000,50,1400],
+ ['arrowLife','Arrow flight time (s)',.2,3,.1,.9],['arrowDmg','Arrow damage (100 = one-shot)',1,200,1,34],['bounceK','Speed kept per wall bounce',0,1.2,.05,1],
+ ['speed','Player speed',100,900,10,290],['dashCd','Dash cooldown (s)',0,5,.1,1.6],['dashSpd','Dash speed',300,4000,50,1500],['dashTime','Dash duration (s)',.05,.6,.01,.14],
+ ['curveWin','Curve window after dash (s)',0,3,.1,1],['curveK','Curve strength x',0,3,.1,1],['need','Kills to climb a floor',1,20,1,3],['lives','Lives (knockouts allowed)',1,20,1,5]];
+// bot difficulty: server-wide
+const BCFG=[['aimErr','Aim error (rad, higher = easier)',0,1.5,.02],['reload','Time between shots (s)',.25,4,.05],['speed','Move speed',40,300,5],['sight','Sight range',200,900,10],['dash','Dash chance when hurt',0,1,.05],['dmg','Damage multiplier',.1,1.5,.05],['floorScale','Harder per floor x',0,2,.05]];
+let devBuilt=false,brows={},pendingBd=null;
+function onBd(v){pendingBd=v;for(const k in brows){brows[k][0].value=v[k];brows[k][1].textContent=v[k]}}
+function buildDev(){
+  if(devBuilt)return;devBuilt=true;$('devbtn').classList.remove('hide');const dev=$('dev'),prows=[];
+  const h3=t=>{const h=document.createElement('h3');h.textContent=t;dev.append(h)};
+  const slider=(label,min,max,step,val,fn)=>{const l=document.createElement('label'),v=document.createElement('span');v.textContent=val;l.append(label,v);
+    const i=document.createElement('input');i.type='range';i.min=min;i.max=max;i.step=step;i.value=val;i.oninput=()=>{v.textContent=i.value;fn(+i.value)};dev.append(l,i);return[i,v]};
+  const btn=(t,fn)=>{const b=document.createElement('button');b.textContent=t;b.onclick=()=>fn(b);dev.append(b);return b};
+  h3('You');for(const [k,l,mn,mx,st,d] of PCFG)prows.push([k,d,...slider(l,mn,mx,st,d,v=>send({t:'cfg',k,v}))]);
+  let god=false,self=true;
+  btn('God mode: off',b=>{god=!god;b.textContent='God mode: '+(god?'on':'off');send({t:'cfg',k:'god',v:god})});
+  btn('Own bounced arrows hurt: on',b=>{self=!self;b.textContent='Own bounced arrows hurt: '+(self?'on':'off');send({t:'cfg',k:'selfHit',v:self})});
+  btn('Reset my settings',()=>{for(const [k,d,i,v] of prows){i.value=d;v.textContent=d;send({t:'cfg',k,v:d})}send({t:'cfg',k:'god',v:false});send({t:'cfg',k:'selfHit',v:true})});
+  h3('Bots');slider('Bots on this floor (-1 = auto)',-1,40,1,-1,v=>send({t:'bots',v}));
+  for(const p of ['easy','normal','hard'])btn(p[0].toUpperCase()+p.slice(1),()=>send({t:'bdpreset',v:p}));
+  for(const [k,l,mn,mx,st] of BCFG)brows[k]=slider(l,mn,mx,st,mn,v=>send({t:'bd',k,v}));
+  if(pendingBd)onBd(pendingBd);
+  h3('Floor');const gl=document.createElement('label');gl.textContent='Go to floor ';const fi=document.createElement('input');fi.type='number';fi.min=1;fi.max=99;fi.value=1;
+  const gb=document.createElement('button');gb.textContent='Go';gb.onclick=()=>send({t:'floor',v:+fi.value||1});gl.append(fi,gb);dev.append(gl);
+  const sm=document.createElement('small');sm.textContent='Your settings affect you only. Bot difficulty affects everyone on the server. Press ` to open or close.';dev.append(sm);
+}
+$('devbtn').onclick=()=>$('dev').classList.toggle('hide');
+
+// ---------- tutorial + settings ----------
+const TUT=[['Your goal','Win fights to climb floors. Get 3 kills on a floor to move up. Each knockout drops you one floor, and after 5 knockouts your run ends. Try to top the leaderboard.'],
+['Moving','Mouse: your archer moves toward the cursor, and the farther away the cursor is, the faster you go. Touch: turn on the joystick in Settings. Left side of the screen moves, right side aims.'],
+['Shooting','Hold left click (or hold on the right side of the screen) to draw your bow, then let go to fire. A longer draw means a faster arrow that flies farther. A full draw takes about half a second.'],
+['Dashing','Press Space (or the DASH button) for a quick dash in the direction you are moving. You cannot be hit while you dash. It needs a moment to recharge.'],
+['Curve shots','Dash, then quickly swing your aim sideways and fire within about a second. The arrow bends the way you swung, and a faster swing makes a sharper curve. Curved arrows are orange.'],
+['Walls and bounces','From floor 2 there are walls. Arrows bounce off them like billiard balls, so you can bank shots around corners. Careful: your own bounced arrow can hit you too.'],
+['Bots and players','Grey names are bots, and they get tougher on higher floors. Coloured names are real players. Both count as kills, but beating real players earns more points.'],
+['Points and skins','Kills and climbing floors earn points. Spend them in the Skins shop on the home screen to change how your archer looks.']];
+for(const [t,x] of TUT){const c=document.createElement('div');c.className='card';const b=document.createElement('b'),p=document.createElement('p');b.textContent=t;p.textContent=x;c.append(b,p);$('howgrid').appendChild(c)}
+$('howbtn').onclick=()=>$('howto').classList.remove('hide');$('howx').onclick=()=>$('howto').classList.add('hide');
+let joy=ls('iov_joy');joy=joy===null||joy===undefined?matchMedia('(pointer:coarse)').matches:joy==='1';   // on by default for touch screens
+const joyLabel=()=>{$('joybtn').textContent='Touch joystick: '+(joy?'On':'Off')};
+$('joybtn').onclick=()=>{joy=!joy;ls('iov_joy',joy?'1':'0');joyLabel()};
+$('setbtn').onclick=()=>{joyLabel();$('settings').classList.remove('hide')};$('setx').onclick=()=>$('settings').classList.add('hide');
+// ---------- touch joystick: left half = move, right half = aim/draw/fire ----------
+const SR=60,UI='#menu,#shop,#dev,#devbtn,#dashbtn,#howto,#settings,#acct';
+let tl=null,ta=null,moveM=0,moveA=0,aimA=0,faceA=0,aiming=false,aimLock=0,fireUntil=0,touched=false;
+const place=(el,x,y)=>{el.style.left=(x-60)+'px';el.style.top=(y-60)+'px';el.classList.remove('hide')};
+const knob=(el,dx,dy)=>{el.firstChild.style.transform=`translate(${dx}px,${dy}px)`};
+function joyDown(e){
+  if(!my)return;touched=true;
+  if(e.clientX<W/2&&!tl){tl={id:e.pointerId,x:e.clientX,y:e.clientY};place($('stL'),tl.x,tl.y);knob($('stL'),0,0)}
+  else if(e.clientX>=W/2&&!ta){ta={id:e.pointerId,x:e.clientX,y:e.clientY};aimA=faceA;aiming=true;fireUntil=performance.now()+80;place($('stR'),ta.x,ta.y);knob($('stR'),0,0)}
+}
+function joyMove(e){
+  for(const [s,el] of [[tl,'stL'],[ta,'stR']]){
+    if(!s||e.pointerId!==s.id)continue;
+    const dx=e.clientX-s.x,dy=e.clientY-s.y,l=Math.hypot(dx,dy),k=l>SR?SR/l:1;knob($(el),dx*k,dy*k);
+    if(s===tl){moveM=l>8?Math.min(1,l/SR):0;if(l>8)moveA=Math.atan2(dy,dx)}else if(l>14)aimA=Math.atan2(dy,dx);
   }
 }
-function seg(px,py,x1,y1,x2,y2){const dx=x2-x1,dy=y2-y1,l=dx*dx+dy*dy;let t=l?((px-x1)*dx+(py-y1)*dy)/l:0;t=Math.max(0,Math.min(1,t));return Math.hypot(px-(x1+dx*t),py-(y1+dy*t))}
-setInterval(()=>{try{tick()}catch(e){console.error('tick error:',e)}},1000/TICK);   // one bad tick must never take the server down
-if(require.main===module)store.init().then(()=>srv.listen(PORT,()=>console.log('imoveryou.io on http://localhost:'+PORT))).catch(e=>{console.error('startup failed:',e);process.exit(1)});
-module.exports={rooms,tick,wss,srv,BD,cache,store,flushProfiles};
+function joyUp(e){
+  if(tl&&e.pointerId===tl.id){tl=null;moveM=0;$('stL').classList.add('hide')}
+  if(ta&&e.pointerId===ta.id){ta=null;aiming=false;aimLock=performance.now()+250;$('stR').classList.add('hide')}   // keep the aim for a moment so the shot goes where you aimed
+}
+$('dashbtn').addEventListener('pointerdown',e=>{e.preventDefault();send({t:'dash'})});
+// ---------- account ----------
+function renderAcct(){const a=!!acct;$('aout').classList.toggle('hide',a);$('ain').classList.toggle('hide',!a);if(a)$('awho').textContent='Signed in as '+acct.name+' ('+acct.email+')'}
+$('acctbtn').onclick=()=>{$('aerr').textContent='';renderAcct();$('acct').classList.remove('hide')};$('acctx').onclick=()=>$('acct').classList.add('hide');
+const cred=()=>({email:$('aemail').value,pass:$('apass').value,name:$('aname').value});
+$('alogin').onclick=()=>send({t:'login',...cred()});$('areg').onclick=()=>send({t:'register',...cred()});$('aoutbtn').onclick=()=>send({t:'logout'});
+$('adel').onclick=()=>{if(confirm('Delete your account, points and skins? This cannot be undone.'))send({t:'delacct',pass:$('apass2').value})};
+function onAcct(s){
+  if(s.err){$('aerr').textContent=s.err;return}
+  $('aerr').textContent='';$('apass').value='';$('apass2').value='';
+  if(s.session){ls('iov_session',s.session);if(s.name)$('nm').value=s.name;$('acct').classList.add('hide')}
+  if(s.out)ls('iov_session','');
+}
+$('play').onclick=startGame;
+connect();requestAnimationFrame(loop);
+</script>
+</body></html>
